@@ -19,7 +19,8 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
-import { BUNDLE_DIR, PRESETS, buildPatches, patchFileFor } from './build-agent-preset-patches.mjs';
+import { PRESETS } from '../src/agent-preset-patches.js';
+import { publishAgentPresets } from '../src/preset-publication.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -83,19 +84,7 @@ function backupBeforeOverwrite(file, keep = 5) {
 //          ① 把 qq-agent-presets bundle 注册进 profile（link: 依赖 + bundles + junction）；
 //          ② 从仓库权威源（dsh/agent-presets/<preset>/）重新生成 patch 文件。
 //        旧目录不再写入、也不删除（见 reportLegacyPresetDir）。
-const BUNDLE_NAMES = ['qq-mode-console', 'qq-agent-presets'];
-
-/** 从仓库源重新生成 bundle 里的 patch 文件（人格正文/工具面改了就必须重跑）。 */
-function regeneratePresetPatches() {
-  const results = buildPatches({ log: () => {} });
-  for (const { file, changed } of results) {
-    log(`preset patch ${changed ? '已生成' : '已是最新'}: ${path.relative(REPO_ROOT, file)}`);
-  }
-  for (const name of PRESETS) {
-    const file = patchFileFor(name);
-    if (!fs.existsSync(file)) fatal(`preset patch 未生成：${file}`);
-  }
-}
+const BUNDLE_NAMES = ['qq-mode-console'];
 
 /**
  * 旧机制的安装目录：0.1.7 起 DSH 完全不再读它。
@@ -263,7 +252,7 @@ function ensureDirLink(linkPath, targetDir, label) {
  * （qq-agent-presets/qq-tool-restrict.mjs），缺了它 preset 会整条挂载失败。
  */
 function ensureBundle(name) {
-  const repoDir = name === 'qq-agent-presets' ? BUNDLE_DIR : path.join(REPO_ROOT, 'plugins', name);
+  const repoDir = path.join(REPO_ROOT, 'plugins', name);
   const linkDir = ensureDirLink(path.join(DSH_HOME, 'plugins', name), repoDir, `bundle ${name} link`);
   ensureDirLink(path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', name), linkDir, `bundle ${name} node_modules link`);
   return linkDir;
@@ -316,9 +305,6 @@ function ensureLocalModeFile() {
   log(`state/mode.json created with mode=reserved2 (fallback if DSH settings are not available)`);
 }
 
-// qq-mode-console / qq-agent-presets 以 link: 依赖注册进 profile package.json 后，DSH 首次启动
-// 需要先安装一次才能解析这些 bundle（否则 cold start 报 "cannot resolve profile bundle"）。
-// dsh CLI 可用时自动执行。
 function autoInstallProfileBundles() {
   if (process.env.QQ_BRIDGE_SKIP_DSH_INSTALL === '1') {
     log('auto-install skipped: QQ_BRIDGE_SKIP_DSH_INSTALL=1');
@@ -340,25 +326,26 @@ function autoInstallProfileBundles() {
     ...(windows ? { env: { ...process.env, QQ_BRIDGE_SETUP_PROFILE: PROFILE } } : {}),
   });
   if (r.error) {
-    log(`auto-install failed to start/complete（${r.error.code || r.error.message}）。`);
-    log(`若 DSH 启动报“cannot resolve profile bundle”，请手动执行：dsh plugin --profile ${PROFILE} install`);
-    return;
+    fatal(`auto-install failed to start/complete（${r.error.code || r.error.message}）；预设尚未发布。请修复 dsh CLI，或用 QQ_BRIDGE_SKIP_DSH_INSTALL=1 显式跳过外部安装后重试。`);
   }
   if (r.status === 0) {
     log(`dsh plugin --profile ${PROFILE} install: OK`);
   } else {
-    log(`dsh plugin --profile ${PROFILE} install 返回退出码 ${r.status}（若 DSH 启动报 bundle 解析失败，请手动重跑该命令）`);
+    fatal(`dsh plugin --profile ${PROFILE} install 返回退出码 ${r.status}；预设尚未发布，请修复安装失败后重试。`);
   }
 }
 
 // Validate the existing YAML before changing any presets or configuration.
 const cordisPatch = prepareCordisPatch();
-regeneratePresetPatches();
 patchCordis(cordisPatch);
 const links = {};
 for (const name of BUNDLE_NAMES) links[name] = ensureBundle(name);
 patchProfilePackage(links);
 reportLegacyPresetDir();
-ensureLocalModeFile();
 autoInstallProfileBundles();
+try {
+  const result = publishAgentPresets({ repoRoot: REPO_ROOT, dshHome: DSH_HOME, profile: PROFILE, install: true });
+  log(`preset bundle 已${result.changed ? '发布' : '校验'}，profile=${PROFILE}`);
+} catch (error) { fatal(error.message); }
+ensureLocalModeFile();
 log('Done. Restart DSH (or reload the profile) so the new presets/MCP take effect.');

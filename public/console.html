@@ -2940,7 +2940,7 @@ async function refreshSimPrompt() {
     document.getElementById('simPromptWarnings').textContent = (r.warnings || []).length
       ? '⚠️ ' + r.warnings.join('；') : '';
     document.getElementById('simPromptRestart').textContent =
-      '改动写入该代预设的源文件并同步到 DSH 的 preset 目录；preset 由 DSH 在会话创建时装配，因此新会话会自动用新版，正在进行的 QQ 会话需重置该会话或重启 DSH。';
+      '保存和还原会发布预设并核验 DSH 安装；重启 DSH 后，新建或重置会话使用新版。安装缺失时先运行安装脚本。';
   } catch (error) {
     setSimMsg('读取失败：' + (error?.message ?? error), false);
   }
@@ -3106,19 +3106,19 @@ document.getElementById('simPromptCancel').addEventListener('click', () => {
 document.getElementById('simPromptPreset').addEventListener('change', () => { refreshSimPrompt(); });
 document.getElementById('simPromptSave').addEventListener('click', async () => {
   const content = document.getElementById('simPromptText').value;
-  if (!confirm('保存会改写该代预设的源文件并同步到 DSH 的 preset 目录（新会话生效，进行中的会话需重置或重启 DSH）。确定继续？')) return;
+  if (!confirm('保存会发布该代预设并检查 DSH 安装。重启 DSH 后，新建或重置会话使用新版。确定继续？')) return;
   setSimMsg('保存中…');
   const r = await api('/api/preset/sim-prompt', 'POST', { preset: simPromptPreset, content });
   if (!r.ok) { setSimMsg('❌ ' + (r.error || '保存失败'), false); return; }
   if (r.unchanged) {
     simPromptOriginal = content;
     setSimEditing(false);
-    setSimMsg('内容没有变化，未写入文件（避免无谓地重排预设格式）', true);
+    setSimMsg('内容没有变化，已确认 DSH 安装与源文件一致', true);
     return;
   }
   simPromptOriginal = content;
   setSimEditing(false);
-  setSimMsg(`✅ 已保存${r.synced ? '并同步到 DSH' : ''}；重启 DSH 后生效`, true);
+  setSimMsg(`✅ 已保存${r.synced ? '并同步到 DSH' : ''}；重启 DSH 后，新建或重置会话生效`, true);
   document.getElementById('simPromptWarnings').textContent = (r.warnings || []).length ? '⚠️ ' + r.warnings.join('；') : '';
   document.getElementById('simPromptStatus').textContent = `${r.status?.label || simPromptPreset} · ${content.length} 字符 · 已保存，待重启 DSH`;
 });
@@ -3126,8 +3126,8 @@ document.getElementById('simPromptRestore').addEventListener('click', async () =
   if (!confirm('还原到该代预设上一次保存前的备份？当前改动会丢失（原文件会先自动备份）。')) return;
   const r = await api('/api/preset/sim-prompt/restore', 'POST', { preset: simPromptPreset });
   if (!r.ok) { setSimMsg('❌ ' + (r.error || '还原失败'), false); return; }
-  setSimMsg(`✅ 已还原（${r.restoredFrom}）；重启 DSH 后生效`, true);
-  refreshSimPrompt();
+  await refreshSimPrompt();
+  setSimMsg(`✅ 已还原（${r.restoredFrom}）；重启 DSH 后，新建或重置会话生效`, true);
 });
 
 // ── 人格注入上限 ────────────────────────────────────────────────────────────

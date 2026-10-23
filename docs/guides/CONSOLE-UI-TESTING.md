@@ -27,6 +27,7 @@ node scripts/console-ui-fixture.mjs --html=path/to/console.html
 ```sh
 npm run test:console-ui          # 等价于 node scripts/test-console-ui.mjs
 node scripts/test-console-ui.mjs --artifacts=docs/ui-verification
+node scripts/test-preset-console-ui.mjs
 ```
 
 脚本使用 Playwright 和 Chromium。优先使用项目内安装的 `playwright`；Windows 上若未安装 Playwright，会自动改用本机 Chrome / Edge，无需下载浏览器。其他环境可安装 Playwright 及其浏览器，或通过以下环境变量指定：

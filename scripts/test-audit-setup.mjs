@@ -24,6 +24,9 @@ function fixture(name, patch = '') {
   fs.copyFileSync(path.join(root, 'scripts/setup-dsh.mjs'), path.join(repo, 'scripts/setup-dsh.mjs'));
   // setup-dsh.mjs 直接从仓库源生成 bundle patch，生成器必须一起进夹具。
   fs.copyFileSync(path.join(root, 'scripts/build-agent-preset-patches.mjs'), path.join(repo, 'scripts/build-agent-preset-patches.mjs'));
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  for (const name of ['agent-preset-patches.js', 'preset-publication.js']) fs.copyFileSync(path.join(root, 'src', name), path.join(repo, 'src', name));
+  fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
   fs.cpSync(path.join(root, 'dsh'), path.join(repo, 'dsh'), { recursive: true });
   fs.cpSync(path.join(root, 'plugins'), path.join(repo, 'plugins'), { recursive: true });
   fs.cpSync(parserRoot, path.join(repo, 'node_modules/js-yaml'), { recursive: true });
@@ -65,7 +68,7 @@ try {
     }
     const pkg = JSON.parse(fs.readFileSync(path.join(f.home, 'profiles/web/package.json')));
     assert.equal(pkg.dependencies.existing, '1.0.0');
-    assert.deepEqual(pkg.dsh.profile.bundles, ['existing', 'qq-mode-console', 'qq-agent-presets']);
+    assert.deepEqual([...pkg.dsh.profile.bundles].sort(), ['existing', 'qq-agent-presets', 'qq-mode-console']);
   });
 
   test('legacy root [] is repaired without altering literal strings', () => {
@@ -105,6 +108,28 @@ try {
     fs.writeFileSync(path.join(blocker.home, 'plugins/qq-mode-console/keep.txt'), 'keep');
     assert.notEqual(blocker.run().status, 0);
     assert.equal(fs.readFileSync(path.join(blocker.home, 'plugins/qq-mode-console/keep.txt'), 'utf8'), 'keep');
+  });
+
+  test('external installer failure exits before publishing preset patches or links', () => {
+    const f = fixture('installer-failure');
+    const bin = path.join(f.repo, 'bin');
+    fs.mkdirSync(bin);
+    const cli = path.join(bin, 'fake-dsh.mjs');
+    fs.writeFileSync(cli, "process.exit(23);\n");
+    const shim = path.join(bin, process.platform === 'win32' ? 'dsh.cmd' : 'dsh');
+    fs.writeFileSync(shim, process.platform === 'win32'
+      ? `@echo off\r\n"${process.execPath}" "${cli}" %*\r\n`
+      : `#!/bin/sh\n"${process.execPath}" "${cli}" "$@"\n`, { mode: 0o755 });
+    const patch = path.join(f.repo, 'plugins/qq-agent-presets/presets/qq-chat-v2.patch.yml');
+    fs.writeFileSync(patch, 'original artifact');
+    const result = f.run('web', {
+      PATH: [bin, path.dirname(process.execPath)].join(path.delimiter), QQ_BRIDGE_SKIP_DSH_INSTALL: '0',
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /23/);
+    assert.equal(fs.readFileSync(patch, 'utf8'), 'original artifact');
+    assert.equal(fs.existsSync(path.join(f.home, 'plugins/qq-agent-presets')), false);
+    assert.doesNotMatch(result.stdout, /Done/);
   });
 
   if (process.platform === 'win32') test('Windows runs the npm .cmd shim with literal profile arguments', () => {

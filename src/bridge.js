@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
+import { inspectPresetPublication, publishAgentPresets } from './preset-publication.js';
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
@@ -428,10 +429,6 @@ function dshHomeDir() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 }
 
-function installedPresetYaml(name) {
-  return path.join(dshHomeDir(), '.agent-presets', name, 'agent.cordis.yml');
-}
-
 // 这里**没有**模块级的 resolvePresetName —— 曾经有一个，但它被 main() 内部同名函数完全遮蔽
 // （函数声明提升到 main 作用域，main 里所有调用点都落到内部那个），是纯死代码。
 // 而且它的语义是错的：未知名字静默回退到 qq-chat-v2，等于 fail-OPEN —— 一旦哪天有人把它
@@ -488,7 +485,7 @@ function presetStatus(name) {
     preset: name,
     label: name === PRESET_NAMES.v1 ? '一代仿真（reserved）' : '二代仿真（reserved2）',
     sourceFile: path.relative(ROOT, presetSourceYaml(name)),
-    installed: fs.existsSync(installedPresetYaml(name)),
+    ...inspectPresetPublication({ repoRoot: ROOT, dshHome: dshHomeDir(), preset: name }),
     requiresRestart: true,
   };
 }
@@ -3781,45 +3778,34 @@ async function main() {
           let nextText;
           try {
             const { text, prefix } = readPresetPromptText(preset);
-            // 内容没变就不要写：写回会把折叠块规整成字面量块（值不变但排版变化），
-            // 让一次"打开又保存"把整个提示词块变成全删全加的 diff，失去可复审性。
             const normalized = String(body.content ?? '').replace(/\r\n/g, '\n').replace(/\n+$/, '');
-            if (normalized === prefix) {
-              sendJson({ ok: true, unchanged: true, chars: prefix.length, warnings: presetPromptWarnings(prefix), synced: fs.existsSync(installedPresetYaml(preset)), requiresRestart: false, status: presetStatus(preset) });
-              return;
+            if (normalized !== prefix) {
+              nextText = renderPresetPromptYaml(text, body.content, preset === PRESET_NAMES.v1 ? 'v1' : 'v2');
             }
-            nextText = renderPresetPromptYaml(text, body.content, preset === PRESET_NAMES.v1 ? 'v1' : 'v2');
           } catch (error) {
             sendJson({ ok: false, error: error?.message ?? '校验失败' }, 400);
             return;
           }
           const warnings = presetPromptWarnings(body.content);
-          let sourceBackup = null;
+          let publication;
           try {
-            sourceBackup = backupPresetFile(preset);
-            atomicWriteText(presetSourceYaml(preset), nextText);
-            // 同步到 DSH 实际读取的安装目录。
-            // 注意：安装副本**不做仓库内备份**——它的内容与刚写好的源文件一致，
-            // 备份它等于把含本机绝对路径的快照塞进仓库工作区，没有额外价值。
-            const installed = installedPresetYaml(preset);
-            if (fs.existsSync(installed)) {
-              fs.copyFileSync(presetSourceYaml(preset), installed);
-            }
+            if (nextText !== undefined) backupPresetFile(preset);
+            publication = publishAgentPresets({
+              repoRoot: ROOT, dshHome: dshHomeDir(),
+              sourceChanges: nextText === undefined ? {} : { [preset]: nextText },
+            });
           } catch (error) {
-            // 尽力回滚源文件，避免留下半截状态
-            if (sourceBackup && fs.existsSync(sourceBackup)) {
-              try { fs.copyFileSync(sourceBackup, presetSourceYaml(preset)); } catch {}
-            }
-            sendJson({ ok: false, error: `写入失败：${error?.message ?? error}` }, 500);
+            sendJson({ ok: false, error: error?.message ?? '发布失败' }, 500);
             return;
           }
-          log(`控制台：${preset} 仿真提示词已更新（${String(body.content ?? '').length} 字符）${warnings.length ? `，${warnings.length} 条警告` : ''}；需重启 DSH 生效`);
+          if (publication.changed) log(`控制台：${preset} 仿真提示词已发布并验证 DSH bundle；需重启 DSH 生效`);
           sendJson({
             ok: true,
+            unchanged: !publication.changed,
             chars: String(body.content ?? '').length,
             warnings,
-            synced: fs.existsSync(installedPresetYaml(preset)),
-            requiresRestart: true,
+            synced: publication.synced,
+            requiresRestart: publication.changed,
             status: presetStatus(preset),
           });
           return;
@@ -3857,11 +3843,9 @@ async function main() {
               return;
             }
             backupPresetFile(preset);
-            atomicWriteText(presetSourceYaml(preset), restored);
-            const installed = installedPresetYaml(preset);
-            if (fs.existsSync(installed)) fs.copyFileSync(presetSourceYaml(preset), installed);
+            const publication = publishAgentPresets({ repoRoot: ROOT, dshHome: dshHomeDir(), sourceChanges: { [preset]: restored } });
             log(`控制台：${preset} 仿真提示词已还原自备份 ${target}；需重启 DSH 生效`);
-            sendJson({ ok: true, restoredFrom: target, requiresRestart: true });
+            sendJson({ ok: true, restoredFrom: target, synced: publication.synced, requiresRestart: publication.changed, status: presetStatus(preset) });
           } catch (error) {
             sendJson({ ok: false, error: error?.message ?? '还原失败' }, 500);
           }
@@ -8280,7 +8264,7 @@ async function main() {
           if (withPreset && preset) {
             log(`会话 ${key} 已挂载 preset ${preset}`);
           } else if (preset) {
-            log(`⚠️ 会话 ${key} 未能挂载 preset ${preset}（${lastError?.message ?? '未知原因'}），已降级为无 preset 会话；请检查 ~/.dsh/.agent-presets/${preset} 后重启 DSH`);
+            log(`⚠️ 会话 ${key} 未能挂载 preset ${preset}（${lastError?.message ?? '未知原因'}），已降级为无 preset 会话；请运行 node scripts/setup-dsh.mjs <profile> 检查 bundle 安装后重启 DSH`);
           }
           break;
         } catch (error) {

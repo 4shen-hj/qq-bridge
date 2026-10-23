@@ -61,7 +61,7 @@
    - 在 `~/.dsh/profiles/web/package.json` 注册 `qq-mode-console` 与 `qq-agent-presets`（`dsh.profile.bundles` + `link:` 依赖），并维护 `node_modules` 下的 junction
    - 把 `qq-mode` 的默认模式设为 `reserved2`（二代仿真）
    - 创建本地 `state/mode.json`（`mode: reserved2`）作为 DSH settings 不可用时的兜底
-   - 尝试自动执行 `dsh plugin --profile web install`（当 `dsh` CLI 在 PATH 中可用时），注册两个插件的 bundle 依赖；若 `dsh` 不在 PATH，缺失依赖时 DSH 会提示补跑
+   - 自动执行 `dsh plugin --profile web install`，随后发布并核验 preset bundle；命令启动失败或返回非零时脚本失败退出，不发布新的 preset 补丁。离线准备时显式设置 `QQ_BRIDGE_SKIP_DSH_INSTALL=1`
 
    > 脚本可重复运行（幂等）：它会重建 `qq-agent-presets` 的 preset patch、更新 MCP 路径并重建失效的插件链接。
    > MCP 条目通过 YAML 解析后**按顶层 `insert` 内的条目 id 增删**（不依赖标记注释），支持带引号的 id、共享 `insert` 与行内 YAML，并保留其他插件配置和嵌套数据。
@@ -74,9 +74,13 @@
    > `<profile>` 必须是单个目录名，不能包含路径分隔符或 `..` 路径跳转。离线准备配置时，可设置 `QQ_BRIDGE_SKIP_DSH_INSTALL=1` 跳过自动安装 bundle，随后手动运行 `dsh plugin --profile <profile> install`。
    > Windows 下脚本通过隐藏的 `cmd.exe` 调用 npm 的 `dsh.cmd` 启动器；`DSH_HOME` 和 profile 参数会传给该进程。
 
+   控制台保存、还原与安装共用 `src/preset-publication.js`。发布先在内存中生成两套补丁，再逐文件原子替换源文件和补丁，并从已注册 profile 的 `node_modules/qq-agent-presets` 读取产物核验。控制台只接受指向本仓库的现有安装；安装缺失或链接指向其他仓库时，先运行本仓库安装脚本修复。旧 `.agent-presets` 目录保留，且不再作为成功依据。
+
+   生成、写入、链接创建或最终核验失败时，发布操作恢复本次修改的源文件、补丁和 preset 注册。回滚失败会在错误中列出需要检查的文件。发布锁清理失败时会报告锁目录，确认没有发布进程后再手工移除。该回滚覆盖运行中错误，不保证断电时多个文件同时提交。安装脚本此前写入的 MCP、模式插件和外部包安装不属于预设发布事务，失败后修复原因并重跑安装脚本。
+
 5. **重启 DSH**：
 
-   必须重启 DSH（或让 DSH 重新加载 profile），新 preset 和 MCP 工具才会生效。
+   必须重启 DSH（或让 DSH 重新加载 profile），新 preset 和 MCP 工具才会生效。之后新建或重置会话，使用更新后的 preset。
 
    > 默认模式为 **`reserved2`（二代仿真）**，即“文本不自动转发、AI 通过工具自主收发”。如果你想改用 `chat` / `closed-agent` / `reserved`，在**桥接控制台**（默认 `http://127.0.0.1:3100`）顶部按钮切换即可 —— 桥接会同时写入 DSH 设置与本地 `state/mode.json`，**无需重启**（每 5 秒轮询即时生效）。本地文件保存模式兜底与 `closedAgentPreset`；正常情况下模式以 DSH 设置为准，请通过控制台切换。
 
@@ -120,7 +124,7 @@ DSH 的 DeepSeek Messages 适配器会拒绝非法的 tool-call 参数 JSON，�
 
 ## 验证是否装好
 
-离线安全回归：`node scripts/test-audit-setup.mjs` 与 `node scripts/test-audit-setup-guards.mjs`。后者直接执行两套 preset 的限制插件，验证本地工具、未声明工具与裸 `web_fetch` / `web_search` 被拒绝，而带 SSRF 防护的 `mcp__web-search-safe__*` 仍然可用。更新 preset 后需重新运行安装脚本并重启 DSH，现有 DSH 安装中的旧副本才会更新。
+离线安全回归：`node scripts/test-audit-setup.mjs` 与 `node scripts/test-audit-setup-guards.mjs`。后者直接执行两套 preset 的限制插件，验证本地工具、未声明工具与裸 `web_fetch` / `web_search` 被拒绝，而带 SSRF 防护的 `mcp__web-search-safe__*` 仍然可用。手工更新 preset 源文件后，重新运行安装脚本发布，再重启 DSH 并新建或重置会话。控制台保存和还原已执行相同的发布检查。
 
 0. **一键自检**：`npm run verify:adaptation` —— 覆盖 preset persona schema、bundle patch 与工具守卫、版本身份一致性、preset fail-closed 护栏，以及**运行中的 DSH 0.2.0 实测**（`qq-mode` 命名空间可列可写、`session/projections`、`session/control` 的 `projections` 形状、`stopSessionWork` 退役会话、`$events` ready 帧、`session/modelCatalog`、点号 endpoint 仍 404）等共 65 项断言。
    > 若你的环境禁止起子进程（例如在 DSH 的沙箱会话里跑），脚本内那批 `node --check` 语法检查会被**显式记为跳过**（`⏭`）而不是报假失败 —— 请在普通终端重跑以覆盖它们。

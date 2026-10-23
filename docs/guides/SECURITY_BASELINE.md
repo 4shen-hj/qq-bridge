@@ -70,6 +70,7 @@
 | 写操作不挂 GET | 全路由审查 | 会触发副作用的接口（表情强制同步、语音同步）一律 POST；GET 只读 |
 | 请求体限制 | `readBody()` | 声明长度或实际累计超过 1 MB → 413；30 秒读取超时 |
 | 安全响应头 | 全部响应 | `X-Frame-Options: DENY`、CSP、`nosniff`、`Referrer-Policy: no-referrer`、`Cache-Control: no-store` |
+| 预设发布 | `src/preset-publication.js` | 保存、还原和 setup 共用发布操作；校验已注册 profile 的 bundle 链接与实际 patch 内容后才报告成功。运行期间失败会恢复原文件，回滚失败明确报错。逐文件原子替换不保证进程崩溃时的多文件原子性 |
 
 有限睡眠唤醒投递失败时保留原原因与截止时间，独立记录下次重试时间，退避从 1 秒增加至最多 60 秒。新唤醒配置、默认配置刷新、重置、模式切换和暂停会取消旧重试，迟到的失败不能重新激活它。
 
