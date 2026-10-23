@@ -24,7 +24,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pathToFileURL } from 'node:url';
-import { collectDshToolNames as collectDshToolNamesShared } from './dsh-tool-names.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const PRESETS_DIR = path.join(ROOT, 'dsh', 'agent-presets');
@@ -44,11 +43,6 @@ const CLOSED_AGENT_PRESETS = ['qsh-closed'];
  * 在 0.1.7 里已不存在（dsh-tool-cordis 现在只注册 cordis_inspect_list/query），
  * 同一轮补上 `load_workspace_dependencies`（自带 Python/Node/pnpm 路径）与
  * `list_subagent_models`（派生 agent 家族）。
- *
- * 两类失败模式，本文件都要防：
- *   ① **漏**（本地工具不在守卫名单里 ⇒ 留在 schema）——由 test 3 对账 RESTRICTED_TOOL_NAMES 防；
- *   ② **拼错假名**（名字根本不存在 ⇒ `tools.restrict` 抛错被吞 ⇒ 静默失效）——
- *      由 test 6 用「假 restrict 会对未知名字抛错」来防。
  *
  * 2026-09-29 针对 DSH 0.2.0-rc.2 重新对账（用 `scripts/scan-dsh-tool-names.mjs`
  * 从安装包里抽真实工具名双向求差）。旧名字全部还在（0 假名），新增 13 个危险语义名字：
@@ -83,31 +77,9 @@ const LOCAL_EXECUTION_TOOLS = [
   'terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close', 'terminal_list',
   'session_search', 'session_trace', 'session_event_read', 'session_event_search', 'session_event_trace',
   'plugin_market', 'create_worktree', 'wait_agent',
-  // 按需安装的可选组合包才注册的名字：0.2.1 起默认不存在，但一旦装上就要挡，
-  // 所以仍在名单里；对账时按「可选项」处理（见下方 OPTIONAL_BUNDLE_TOOLS）。
+  // 按需安装的可选组合包才注册的名字；安装后也必须受守卫限制。
   'subagent_codex', 'subagent_claude_code',
 ];
-
-/** 0.2.1 起 Codex / Claude Code 改为按需安装：这组名字默认扫不到，不算拼错假名。 */
-const OPTIONAL_BUNDLE_TOOLS = new Set(['subagent_codex', 'subagent_claude_code']);
-
-/**
- * 工具名 → 真实存在与否。抽取实现在 `scripts/dsh-tool-names.mjs`（唯一实现，
- * 与 `scan-dsh-tool-names.mjs` 共用），用来抓"拼错的假名"。
- *
- * 历史坑：本测试过去自带一份**模糊**抽取器（全文件乱扫 `name: 'x'` + 只认少数
- * 包名前缀 + 只读包根目录的 cordis.patch.yml）。0.2.0 对账时它把 10 个**真实存在**
- * 的工具名报成假名：`dsh-mcp-resources` / `dsh-experimental-tool-agent-team` 不匹配
- * 它的包名白名单，`subagent_codex` 写在 `dsh-web-app/presets/*.patch.yml` 而非包根。
- * 误判方向很危险——它会逼人把真名字从守卫名单里删掉，等于自己拆掉安全边界。
- * 现在只保留一条实现，两边不可能再漂移。
- */
-function collectDshToolNames() {
-  const { names } = collectDshToolNamesShared();
-  return names.size === 0 ? null : new Set(names.keys());
-}
-/** 允许出现在名单里、但不属于"本地执行"语义的名字（开发/注入器）。 */
-const DEV_TOOL_PREFIX = /^dev_/;
 
 /** 允许出现的 MCP 命名空间前缀（QQ 动作面）。 */
 const EXPECTED_SAFE_PREFIXES = [
@@ -203,27 +175,6 @@ test('守卫导出的名单与本测试的清单一致（防两份名单各自�
       assert.ok(!mod.RESTRICTED_TOOL_NAMES.includes(allowed),
         `${id}: ${allowed} 是无害模型侧工具，不应出现在 restrict 名单里（会与 SAFE_EXACT 自相矛盾）`);
     }
-  }
-});
-
-test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错假名静默失效）', async () => {
-  // 为什么必须测：`tools.restrict()` 对未知名字会**抛错**，而守卫逐个 try/catch
-  // 只打日志 ⇒ 拼错的名字 = **静默 no-op**。这正是本名单初版的真实缺陷：
-  // pwsh_persistent / bash_persistent / cordis / goal_write / goal_read 五个假名
-  // 让整批限制悄悄少生效，而套件当时全绿。
-  const dshNames = collectDshToolNames();
-  if (dshNames === null) {
-    console.log('  ⏭  跳过：未找到 DSH 工具包（设 DSH_TOOL_PACKAGES 指向 @deepseek-ai 目录即可启用）');
-    return;
-  }
-  for (const id of SIMULATION_PRESETS) {
-    const { dir } = readPreset(id);
-    const mod = await import(pathToFileURL(path.join(dir, 'qq-tool-restrict.mjs')).href);
-    const fabricated = mod.RESTRICTED_TOOL_NAMES
-      .filter((n) => !DEV_TOOL_PREFIX.test(n) && !OPTIONAL_BUNDLE_TOOLS.has(n) && !dshNames.has(n));
-    assert.deepEqual(fabricated, [],
-      `${id}: 以下名字在 DSH 已安装的工具包里找不到 ⇒ restrict 会抛错并被吞掉，`
-      + `限制静默失效：${fabricated.join(', ')}`);
   }
 });
 

@@ -160,8 +160,7 @@ check('守卫已覆盖 0.2.1 新增的危险工具名', missingFromGuard021.leng
 
 // 守卫名单里的每个名字都必须是 DSH 真实注册的工具：`tools.restrict()` 对未知名字会抛错，
 // 而守卫逐个 try/catch 只打日志 ⇒ 拼错的名字 = 静默 no-op。
-// 扫描器（scripts/scan-dsh-tool-names.mjs）与 test-preset-local-tools.mjs 共用
-// scripts/dsh-tool-names.mjs 这一份抽取实现，所以这里直接复用，不会出现两套口径。
+// 与扫描器 scripts/scan-dsh-tool-names.mjs 共用 scripts/dsh-tool-names.mjs。
 const { collectDshToolNames } = await import(pathToFileURL(path.join(ROOT, 'scripts/dsh-tool-names.mjs')).href);
 const scanned = collectDshToolNames();
 if (scanned.names.size === 0) {

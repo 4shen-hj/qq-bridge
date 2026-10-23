@@ -36,8 +36,8 @@ export const inject = ['tools']
  * 不是凭印象列举。教训：本名单初版把 `pwsh_persistent`/`bash_persistent`/
  * `cordis`/`goal_write`/`goal_read` 当成工具名，这五个**根本不存在**——
  * 而 `tools.restrict()` 对未知名字会抛错、被下面的 try/catch 逐个吞掉，
- * 于是坏名字**静默失效**。`test-preset-local-tools.mjs` 现在会把本数组与
- * DSH 真实工具名集合求差，专门防这类拼写假名。
+ * 当时坏名字会静默失效。现在用 `scan-dsh-tool-names.mjs` 对账已安装工具，
+ * 并由 `test-preset-local-tools.mjs` 验证守卫的限制与放行行为。
  *
  * 2026-09-27 针对 0.1.7-rc.2 重新对账（不是逐个打补丁）：`dsh-tool-cordis` 仍在，
  * 但 `cordis_define`/`cordis_undefine`/`cordis_run`/`cordis_stop` 四个名字**已被删除**，
@@ -115,7 +115,7 @@ export const inject = ['tools']
  *    因此 `subagent_codex` / `subagent_claude_code` 在默认安装里**不存在**——
  *    restrict 对它们必然抛错。但用户一旦装上那两个组合包，名字就会回到全局层，
  *    所以仍然保留为**可选项名单**（{@link OPTIONAL_BUNDLE_TOOL_NAMES}）而不是删掉；
- *    扫描器/测试把这一组排除在「拼错假名」判定之外，其余名字照旧逐个对账。
+ *    扫描器和适配检查把这一组排除在「拼错假名」判定之外。
  */
 const LOCAL_EXECUTION_TOOLS = [
   // shell / 进程
@@ -171,7 +171,7 @@ const LOCAL_EXECUTION_TOOLS = [
  * 保留的收益：用户装上 Codex / Claude Code 组合包后，名字回到全局层时**立刻**被挡，
  * 不必等下一次对账。
  *
- * 扫描器与测试用这一组把「可选项」和「拼错的假名」区分开：只有不在本组、又扫不到的
+ * 扫描器与适配检查用这一组把「可选项」和「拼错的假名」区分开：只有不在本组、又扫不到的
  * 名字才判成假名。
  */
 export const OPTIONAL_BUNDLE_TOOL_NAMES = Object.freeze([
@@ -207,7 +207,6 @@ const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
   'dev_uninject_plugin',
 ]
 
-// 供 test-preset-local-tools.mjs 导入并与 DSH 真实工具名对账，避免两份名单漂移。
 export const RESTRICTED_TOOL_NAMES = Object.freeze([...KNOWN_DANGEROUS_GLOBAL_TOOLS])
 
 // 执行期白名单：不在这些范围内的工具一律拒绝。

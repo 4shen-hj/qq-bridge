@@ -155,13 +155,15 @@ DSH 的 Windows 文件沙箱按**能力 SID** 授权：SID 由 `sha256(规范化
 ## 四、发布前必须跑的检查（回归清单）
 
 ```bash
-npm run test:audit          # 30 个离线回归脚本（含安全专项），必须全绿
+npm run test:audit          # 离线回归脚本（含安全专项），必须全绿
 npm run verify:adaptation   # DSH 适配一致性（preset/工具守卫/MCP 挂载/活 DSH 实测）
 npm run verify:persona      # 人格配置一致性
 npm run diagnose:acl        # ACL 收紧路径盘点（只读；需在**无沙箱**终端跑，见 §2.6）
 npm run scan:tool-names     # 守卫名单 vs 已安装 DSH 的真实工具名（每次升级 DSH 后跑）
 node --check src/bridge.js  # 语法门禁（大文件改动后必跑）
 ```
+
+离线审计验证工具守卫的限制与放行行为，不要求本机安装全部可选插件。已安装工具的名称对账由 `npm run scan:tool-names` 单独执行。
 
 安全专项必须覆盖（缺一不可）：
 
