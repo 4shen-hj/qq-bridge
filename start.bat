@@ -5,9 +5,9 @@ rem Harden state/ ACLs (Windows needs WRITE_DAC; the directory owner normally ha
 rem so no UAC prompt in the usual case). This NEVER blocks startup: if it cannot get
 rem permission it prints a copy-pasteable command and exits 0.
 rem See docs/guides/SECURITY_BASELINE.md ("secrets at rest").
-node scripts\harden-state-acl.mjs --quiet
+node "%~dp0scripts\harden-state-acl.mjs" --quiet
 :loop
-node src/bridge.js
+node "%~dp0src\bridge.js"
 set code=%errorlevel%
 if "%code%"=="2" (
     echo [%date% %time%] bridge already running in another window. Exiting.
