@@ -2795,6 +2795,7 @@ async function main() {
     // 按 key 记账的内存态在**有映射和无映射时都要清**：一条被移出白名单、
     // 但从未成功建过会话的 key 同样会留下限流时间戳与失败标记。
     forgetConversationCaches(key);
+    clearSocialV2Timers(key);
     if (!sessionId) return;
     reverse.delete(sessionId);
     collectors.delete(sessionId);
@@ -2813,7 +2814,6 @@ async function main() {
     const entry = pending.get(key);
     if (entry) { clearTimeout(entry.timer); void cancelPendingEntry(entry).catch(() => {}); }
     pending.delete(key);
-    clearSocialV2Timers(key);
     cancelSocialTimers(key);
     disarmPendingWakeLease(key);
     pendingWakeKeys.delete(key);
@@ -5052,6 +5052,7 @@ async function main() {
             return;
           }
           const markedCount = acknowledgeOnClose ? acknowledgeMessagesV2(st, throughSeq) : 0;
+          cancelWakeRetryV2(st);
           st.wakeConfig = next;
           st.wakeConfig.lastWakeAt = st.wakeConfig.lastWakeAt || 0;
           st.wakeConfig.wakeCount = st.wakeConfig.wakeCount || 0;
@@ -8425,6 +8426,7 @@ async function main() {
     if (st.wakeConfig.confirmedBy !== 'default') return false;
     const def = defaultWakeConfigV2();
     const old = st.wakeConfig;
+    cancelWakeRetryV2(st);
     st.wakeConfig = {
       ...def,
       lastWakeAt: old.lastWakeAt || 0,
@@ -8514,6 +8516,7 @@ async function main() {
         clearTimeout(st.sleepTimer);
         st.sleepTimer = null;
       }
+      cancelWakeRetryV2(st);
       st.wakeConfig = defaultWakeConfigV2();
       if (!opts.skipSave) saveSocialV2State();
       if (key) setupSleepTimerV2(key);
@@ -8549,6 +8552,7 @@ async function main() {
         replyCheckTimer: null,
         proactiveTimer: null,
         rateLimitRetryTimer: null,
+        wakeRetry: null,
         lastIncomingAt: 0,
         preSleepWaitSatisfiedAt: 0,
         preSleepWaitObservedAt: 0,
@@ -8617,6 +8621,7 @@ async function main() {
             sleepTimer: null,
             replyCheckTimer: null,
             proactiveTimer: null,
+            wakeRetry: null,
             lastIncomingAt: Number(val.lastIncomingAt) || 0,
             preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
@@ -10501,6 +10506,7 @@ async function main() {
       return;
     }
     const st = getSocialV2State(key);
+    if (st.wakeRetry?.timer) return;
     // 防重入：如果该会话已经有一个 DSH turn 在进行中（AI 正在思考/调用工具），
     // 或已有排队/在途 prompt，则不再投递新的候选唤醒，避免“思维链进行中又塞入一个 question 唤醒”。
     if (isConversationBusyV2(key, st)) {
@@ -10565,6 +10571,11 @@ async function main() {
     // 无论提前唤醒还是超时唤醒，都清理有限潜水定时器与 sleepUntil，避免状态残留/重复唤醒
     const prevSleepUntil = st.wakeConfig.sleepUntil;
     const hadFiniteSleep = !st.wakeConfig.infinite && !!prevSleepUntil && Number.isFinite(Date.parse(prevSleepUntil));
+    const wakeConfig = st.wakeConfig;
+    const retry = st.wakeRetry ?? (hadFiniteSleep
+      ? { reason, sleepUntil: prevSleepUntil, attempts: 0, nextAttemptAt: null, timer: null }
+      : null);
+    st.wakeRetry = retry;
     if (st.sleepTimer) {
       clearTimeout(st.sleepTimer);
       st.sleepTimer = null;
@@ -10581,39 +10592,48 @@ async function main() {
       if (idx >= 0) st.wakeTimes.splice(idx, 1);
       saveSocialV2State();
     };
+    const retryFailedWake = () => {
+      if (!retry || st.wakeRetry !== retry || socialV2.conversations.get(key) !== st
+          || st.wakeConfig !== wakeConfig || currentMode !== 'reserved2' || socialV2.paused
+          || !isSessionAllowedInCurrentMode(key)) return;
+      st.wakeConfig.sleepUntil = retry.sleepUntil;
+      st.wakeConfig.infinite = false;
+      retry.attempts++;
+      const delay = Math.min(60000, 1000 * 2 ** Math.min(retry.attempts - 1, 6));
+      retry.nextAttemptAt = Date.now() + delay;
+      retry.timer = setTimeout(() => {
+        if (st.wakeRetry !== retry) return;
+        retry.timer = null;
+        retry.nextAttemptAt = null;
+        void sendWakePromptV2(key, retry.reason).catch((error) => log(`[reserved2] 唤醒投递重试异常 ${key}:`, error?.message ?? error));
+      }, delay);
+      retry.timer.unref?.();
+      saveSocialV2State();
+      log(`[reserved2] ${delay / 1000}s 后重试唤醒投递 ${key}（${retry.reason}）`);
+    };
     try {
       pendingWakeKeys.add(key);
       armPendingWakeLease(key);
       const result = await deliverPrompt(key, promptText, { wakeReason: reason });
-      const restoreFiniteSleep = () => {
-        if (hadFiniteSleep) {
-          st.wakeConfig.sleepUntil = prevSleepUntil;
-          st.wakeConfig.infinite = false;
-          saveSocialV2State();
-          setupSleepTimerV2(key);
-        }
-      };
       if (result && result.ok === false) {
         pendingWakeKeys.delete(key);
         disarmPendingWakeLease(key);
         rollbackWakeTime();
-        restoreFiniteSleep();
+        retryFailedWake();
         log(`[reserved2] 唤醒投递被拒 ${key}: ${result.error || '未知错误'}`);
-      } else if (result && result.queued === true) {
-        // 入队而非真正在途：保留 pendingWakeKeys，等 DSH 恢复后真正投递的 turn/end 再触发收尾保护；
-        // 不能在这里删除，否则补投的唤醒回合会丢失“未设置唤醒配置”的安全兜底。
-        log(`[reserved2] 唤醒已入队 ${key}（${reason}），等待 DSH 恢复后补投`);
+      } else {
+        if (st.wakeRetry === retry) cancelWakeRetryV2(st);
+        if (result && result.queued === true) {
+          // 入队而非真正在途：保留 pendingWakeKeys，等 DSH 恢复后真正投递的 turn/end 再触发收尾保护；
+          // 不能在这里删除，否则补投的唤醒回合会丢失“未设置唤醒配置”的安全兜底。
+          log(`[reserved2] 唤醒已入队 ${key}（${reason}），等待 DSH 恢复后补投`);
+        }
       }
     } catch (error) {
       pendingWakeKeys.delete(key);
       disarmPendingWakeLease(key);
       rollbackWakeTime();
-      if (hadFiniteSleep) {
-        st.wakeConfig.sleepUntil = prevSleepUntil;
-        st.wakeConfig.infinite = false;
-        saveSocialV2State();
-        setupSleepTimerV2(key);
-      }
+      retryFailedWake();
       log(`[reserved2] 唤醒投递失败 ${key}: ${error?.message ?? error}`);
     }
   }
@@ -10807,6 +10827,12 @@ async function main() {
       st.sleepTimer = null;
     }
     if (socialV2.paused) return;
+    if (st.wakeRetry) {
+      if (!st.wakeRetry.timer) {
+        void sendWakePromptV2(key, st.wakeRetry.reason).catch((error) => log(`[reserved2] 恢复唤醒投递异常 ${key}:`, error?.message ?? error));
+      }
+      return;
+    }
     const wc = st.wakeConfig;
     if (!wc || wc.infinite || !wc.sleepUntil) return;
     const until = Date.parse(wc.sleepUntil);
@@ -10885,9 +10911,15 @@ async function main() {
     log(`[reserved2] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
   }
 
+  function cancelWakeRetryV2(st) {
+    if (st.wakeRetry?.timer) clearTimeout(st.wakeRetry.timer);
+    st.wakeRetry = null;
+  }
+
   function clearSocialV2Timers(key) {
     const st = socialV2.conversations.get(key);
     if (!st) return;
+    cancelWakeRetryV2(st);
     if (st.pendingWakeTimer) {
       clearTimeout(st.pendingWakeTimer);
       st.pendingWakeTimer = null;
@@ -11612,6 +11644,7 @@ async function main() {
                     const limit = Number(cfg.socialV2?.wake?.noActionLimit) || 3;
                     if (st.wakeConfig.noActionCount >= limit) {
                       log(`[reserved2] ${key} 连续 ${st.wakeConfig.noActionCount} 次唤醒无行动，重置唤醒配置`);
+                      cancelWakeRetryV2(st);
                       st.wakeConfig = defaultWakeConfigV2();
                       st.bootstrapSent = true;
                       st.wakeConfig.noActionCount = 0;
@@ -11690,6 +11723,7 @@ async function main() {
                     log(`[reserved2] ${key} 未设置唤醒条件，发送提醒 (${currentMiss}/${maxReminders})`);
                   } else {
                     const st = getSocialV2State(key);
+                    cancelWakeRetryV2(st);
                     st.wakeConfig = defaultWakeConfigV2();
                     saveSocialV2State();
                     log(`[reserved2] ${key} 连续未设置唤醒条件，已重置为默认唤醒配置`);
