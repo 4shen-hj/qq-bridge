@@ -80,6 +80,32 @@
 
    > 默认模式为 **`reserved2`（二代仿真）**，即“文本不自动转发、AI 通过工具自主收发”。如果你想改用 `chat` / `closed-agent` / `reserved`，在**桥接控制台**（默认 `http://127.0.0.1:3100`）顶部按钮切换即可 —— 桥接会同时写入 DSH 设置与本地 `state/mode.json`，**无需重启**（每 5 秒轮询即时生效）。本地文件保存模式兜底与 `closedAgentPreset`；正常情况下模式以 DSH 设置为准，请通过控制台切换。
 
+## 配置工具参数格式错误的有界重试
+
+DSH 的 DeepSeek Messages 适配器会拒绝非法的 tool-call 参数 JSON，并报告 `MALFORMED_RESPONSE`。在支持 provider `retryPolicy` 的 DSH 版本中，可让失败的模型请求重新采样。桥接不重新投递原始用户消息，避免重放此前已完成的发送动作。
+
+1. 确认桥接实际连接的 DSH 进程、profile 和 provider。桌面端可能使用 `desktop` profile，不能只修改默认的 `web` profile。
+2. 备份该 profile 的 `cordis.patch.yml`。找到实际 provider 的配置行，保留已有连接参数和其他配置，在其 `config` 下合并以下字段：
+
+   ```yaml
+   retryPolicy:
+     mode: normal
+     maxRetries: 2
+     retryableCodes:
+       - EMPTY_RESPONSE
+       - RATE_LIMIT
+       - SERVER
+       - TIMEOUT
+       - TRANSPORT
+       - MALFORMED_RESPONSE
+   ```
+
+3. 验证 YAML，并通过运行中 DSH 的设置读取确认策略已生效。当前版本若不热加载该配置，需要重载对应 provider 或重启 DSH。
+
+`maxRetries: 2` 表示最多额外请求两次，也影响这个策略中的其他错误。`retryableCodes` 是整表替换；已有自定义错误码需要一并保留。不要使用无界的 `always` 模式。profile 的 provider 配置可能整体覆盖 bundle 配置，修改时必须保留该路由需要的现有字段。安装脚本不会自动覆盖用户的 provider 重试策略。
+
+重试耗尽后，桥接在 `reserved` 和 `reserved2` 模式下静默处理已识别的工具参数 JSON 格式错误。其他回合错误仍给出普通失败提示，原始错误不会发送到 QQ。本地日志保留脱敏诊断。错误和中止回合释放忙状态，但不累计“无行动”或“未设置唤醒”惩罚，也不自动确认未读消息。有效唤醒配置保持不变；如果本次唤醒已消耗唯一的定时器，结束后没有任何唤醒途径，则恢复默认唤醒配置并保留行为计数，不重新投递失败回合。
+
 ## 验证是否装好
 
 离线安全回归：`node scripts/test-audit-setup.mjs` 与 `node scripts/test-audit-setup-guards.mjs`。后者直接执行两套 preset 的限制插件，验证本地工具、未声明工具与裸 `web_fetch` / `web_search` 被拒绝，而带 SSRF 防护的 `mcp__web-search-safe__*` 仍然可用。更新 preset 后需重新运行安装脚本并重启 DSH，现有 DSH 安装中的旧副本才会更新。

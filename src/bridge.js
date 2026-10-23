@@ -11594,11 +11594,12 @@ async function main() {
             // collector 生命周期见 trackTurnEvent()：只为 turn/start 建、空壳 turn/end 即清。
             const { ended } = trackTurnEvent(frame.sessionId, frame.event);
             if (ended) {
-              // reserved2 无行动兜底：普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
+              const completed = ended.reason.kind === 'completed';
+              // reserved2 无行动兜底：正常完成的普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
               const silentQueueNow = social.silentTurns.get(frame.sessionId) ?? [];
               const isSilentTurn = silentQueueNow.length > 0;
-              if (currentMode === 'reserved2' && key && !isSilentTurn) {
+              if (completed && currentMode === 'reserved2' && key && !isSilentTurn) {
                 const st = getSocialV2State(key);
                 const turnStart = v2TurnStartAt.get(frame.sessionId) ?? 0;
                 const sendToolHit = sendToolSucceededSessions.has(frame.sessionId);
@@ -11630,6 +11631,21 @@ async function main() {
               sendToolSucceededSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
               toolCallNames.delete(frame.sessionId);
+              if (!completed) {
+                const wasWakeTurn = pendingWakeKeys.delete(key);
+                disarmPendingWakeLease(key);
+                wakeConfigUpdatedKeys.delete(key);
+                markReadCalledKeys.delete(key);
+                if (wasWakeTurn && currentMode === 'reserved2') {
+                  const st = getSocialV2State(key);
+                  const previousConfig = st.wakeConfig;
+                  ensureWakeableV2(st, { key, skipSave: true });
+                  if (st.wakeConfig !== previousConfig) {
+                    st.wakeConfig.noActionCount = previousConfig.noActionCount ?? 0;
+                    saveSocialV2State();
+                  }
+                }
+              }
               // 标记本次 turn 是否为“活跃超时退场”发言（用于准确回到观望，避免把旧回复误判为退场）
               const isFarewell = social.exitingSessions.has(frame.sessionId);
               if (isFarewell) social.exitingSessions.delete(frame.sessionId);
@@ -11638,16 +11654,17 @@ async function main() {
               const silentQueue = social.silentTurns.get(frame.sessionId) ?? [];
               const silentNow = Date.now();
               while (silentQueue.length && silentNow - silentQueue[0].ts > SILENT_TURN_TIMEOUT_MS) silentQueue.shift();
-              if (silentQueue.length > 0) {
+              const suppressTurnOutput = silentQueue.length > 0;
+              if (suppressTurnOutput) {
                 silentQueue.shift();
                 if (silentQueue.length > 0) social.silentTurns.set(frame.sessionId, silentQueue);
                 else social.silentTurns.delete(frame.sessionId);
                 log(`摘要投喂 turn 结束，静默 (${key})`);
-                continue;
+                if (completed) continue;
               }
               // reserved2 防遗忘：每次唤醒回合结束时，若 AI 没有调用 qq_set_wake_config 设置下一次唤醒条件，
               // 则发送提醒；连续未设置达到上限后重置为默认唤醒配置。静默/后台提醒回合已在上方 continue，不触发。
-              if (pendingWakeKeys.has(key)) {
+              if (completed && pendingWakeKeys.has(key)) {
                 pendingWakeKeys.delete(key);
                 disarmPendingWakeLease(key);
                 if (wakeConfigUpdatedKeys.has(key) || markReadCalledKeys.has(key)) {
@@ -11809,12 +11826,22 @@ async function main() {
                   await sendToQQ(key, plain);
                 }
               } else if (ended.reason.kind === 'error') {
-                const msg = ended.reason.error?.message ?? '未知错误';
-                const safeMsg = shouldAuditKey(key) && SENSITIVE_RE.test(msg) ? '（含敏感信息，已隐藏）' : msg.slice(0, 500);
-                // 以前这里只发 QQ、不写日志：出问题时 bridge.log 里什么都没有，排查只能靠猜（PR #24）。
-                log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
-                appendActivity(`${key} agent 处理出错：${safeMsg.slice(0, 80)}`);
-                await sendToQQ(key, `⚠️ agent 处理出错：${safeMsg}`);
+                const error = ended.reason.error;
+                const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code ?? '') ? error.code : 'UNKNOWN';
+                const message = String(error?.message ?? '未知错误');
+                const malformedToolInput = code === 'MALFORMED_RESPONSE' && /\btool input is invalid JSON\b/i.test(message);
+                const quietMalformed = malformedToolInput && (currentMode === 'reserved' || currentMode === 'reserved2');
+                const safeMessage = malformedToolInput ? 'tool input is invalid JSON' : redactSensitiveText(message).slice(0, 500);
+                log('⚠️ agent 处理出错', {
+                  key, sessionId: frame.sessionId, turn: ended.turn, code,
+                  category: malformedToolInput ? 'tool_input_json' : 'turn_error',
+                  message: safeMessage,
+                  notifyQQ: !suppressTurnOutput && !quietMalformed,
+                });
+                appendActivity(`${key} agent 处理出错 (${code})：${safeMessage.slice(0, 80)}`);
+                if (!suppressTurnOutput && !quietMalformed) {
+                  await sendToQQ(key, '⚠️ 这次没能完成回复，请稍后再试。');
+                }
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {
@@ -11826,7 +11853,7 @@ async function main() {
                 }
               } else if (ended.reason.kind === 'aborted') {
                 log(`⏹️ 回合被中止 (${key})`);
-                await sendToQQ(key, '⏹️ 已停止');
+                if (!suppressTurnOutput) await sendToQQ(key, '⏹️ 已停止');
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {
