@@ -165,21 +165,80 @@ test('image byte limits and signatures are checked', async (t) => {
   await assert.rejects(safeFetchBuffer('http://93.184.216.34/'), /不是有效图片/);
 });
 
-test('text and image requests have a total deadline despite continuous incoming data', async (t) => {
+test('text requests have a 20s total deadline despite continuous incoming data', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { requests, responses } = mockTransport(t, [{ produce() {} }, { produce() {} }]);
-  for (const fetcher of [safeFetch, safeFetchBuffer]) {
-    const pending = fetcher('http://93.184.216.34/');
-    const rejected = assert.rejects(pending, /请求超时/);
-    // Let URL validation and the mocked response callback complete.
-    for (let i = 0; i < 8; i++) await Promise.resolve();
-    t.mock.timers.tick(19000);
+  const { requests, responses } = mockTransport(t, [{ produce() {} }]);
+  const pending = safeFetch('http://93.184.216.34/');
+  const rejected = assert.rejects(pending, /请求超时/);
+  // Let URL validation and the mocked response callback complete.
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  t.mock.timers.tick(19000);
+  responses.at(-1).write(Buffer.from('a'));
+  t.mock.timers.tick(1000);
+  await rejected;
+  assert.equal(requests.at(-1).req.destroyed, true);
+  assert.equal(responses.at(-1).destroyed, true);
+});
+
+// 图片/表情下载改成「空闲超时」而不是墙钟预算（见 safe-fetch 顶部的说明）：
+// 慢但一直在传的大图不能被 8 秒砍断，真正停住的连接仍然要判死。
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0, 0, 0, 0]);
+
+function trackSettled(promise) {
+  const state = { settled: false };
+  promise.then(() => { state.settled = true; }, () => { state.settled = true; });
+  return state;
+}
+
+test('image downloads keep waiting while data keeps trickling in', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { requests, responses } = mockTransport(t, [{ produce() {} }]);
+  const pending = safeFetchBuffer('http://93.184.216.34/');
+  const state = trackSettled(pending);
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  // 每 5 秒来一块：总耗时远超旧的 8 秒单地址/20 秒总预算，但连接一直是活的。
+  const written = [];
+  for (let elapsed = 0; elapsed < 60000 && !state.settled; elapsed += 5000) {
+    responses.at(-1).write(PNG_BYTES);
+    written.push(PNG_BYTES);
+    t.mock.timers.tick(5000);
+    await Promise.resolve();
+  }
+  assert.equal(state.settled, false, '还在收数据时不应被判超时');
+  responses.at(-1).end();
+  const result = await pending;
+  assert.deepEqual(result.buffer, Buffer.concat(written));
+  assert.equal(requests.at(-1).req.destroyed, false);
+});
+
+test('image downloads fail once the connection stops producing data', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { responses } = mockTransport(t, [{ produce() {} }]);
+  const pending = safeFetchBuffer('http://93.184.216.34/');
+  const rejected = assert.rejects(pending, /请求超时/);
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  responses.at(-1).write(PNG_BYTES);
+  t.mock.timers.tick(11000);
+  t.mock.timers.tick(1000);
+  await rejected;
+  assert.equal(responses.at(-1).destroyed, true);
+});
+
+test('image downloads still have a hard upper bound even while data keeps flowing', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { responses } = mockTransport(t, [{ produce() {} }]);
+  const pending = safeFetchBuffer('http://93.184.216.34/');
+  const state = trackSettled(pending);
+  const rejected = assert.rejects(pending, /请求超时/);
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  // 每秒一滴：空闲超时永远不触发，只能靠整轮硬上限结束 —— 防止对端滴流把请求吊死。
+  for (let elapsed = 0; elapsed < 120000 && !state.settled; elapsed += 1000) {
     responses.at(-1).write(Buffer.from('a'));
     t.mock.timers.tick(1000);
-    await rejected;
-    assert.equal(requests.at(-1).req.destroyed, true);
-    assert.equal(responses.at(-1).destroyed, true);
+    await Promise.resolve();
   }
+  await rejected;
+  assert.equal(state.settled, true);
 });
 
 test('aborted bodies reject instead of leaving the operation pending', async (t) => {

@@ -86,7 +86,7 @@ console.log('## sticker-lib 纯函数');
 
 console.log('## 配置文件');
 {
-  const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
+  const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.example.json'), 'utf8'));
   const tools = cfg.socialV2?.tools ?? {};
   ok(tools.listStickers === true, 'config listStickers=true');
   ok(tools.getStickerImage === true, 'config getStickerImage=true');
@@ -121,6 +121,41 @@ console.log('## bridge 路由/函数存在性');
   const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
   for (const s of ['/api/socialV2/sticker-list', '/api/socialV2/sticker-image', '/api/socialV2/sticker-note', '/api/socialV2/send-sticker', '/api/socialV2/sticker-remark', '/api/stickers', 'syncStickerLibrary', 'sendStickerV2']) {
     ok(bridge.includes(s), `bridge 包含 ${s}`);
+  }
+  ok(bridge.includes('stickerCache?.get('), 'bridge 发送表情前会查本地缓存');
+}
+
+console.log('## 表情图片缓存');
+{
+  const os = await import('node:os');
+  const { createStickerCache, normalizeCacheKey } = await import('../src/sticker-cache.js');
+  ok(normalizeCacheKey('2986900870_0_0_0_D2D506E9A42CD52E3A4612E572EEF332_0_0') === '2986900870_0_0_0_D2D506E9A42CD52E3A4612E572EEF332_0_0', '合法 md5 直接作为缓存键');
+  ok(normalizeCacheKey('../../etc/passwd') === null || !/[\\/]/.test(normalizeCacheKey('../../etc/passwd')), '路径穿越的缓存键被清洗');
+  ok(normalizeCacheKey('') === null && normalizeCacheKey(null) === null, '空键返回 null');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sticker-cache-'));
+  try {
+    const cache = createStickerCache(dir, { maxBytes: 25 });
+    const a = Buffer.from('aaaaaaaaaa');
+    const b = Buffer.from('bbbbbbbbbb');
+    const c = Buffer.from('cccccccccc');
+    ok(cache.get('miss') === null, '未命中的键返回 null');
+    ok(cache.set('a', a) === true && cache.get('a')?.equals(a) === true, '写入后能读回同样的字节');
+    cache.set('b', b);
+    cache.set('c', c);
+    // 30 字节 > 25 字节上限：必须淘汰掉最旧的，总量回到上限内。
+    const stats = cache.stats();
+    ok(stats.files === 2 && stats.bytes === 20, `超出上限会淘汰旧文件（files=${stats.files}, bytes=${stats.bytes}）`);
+    ok(cache.get('c')?.equals(c) === true, '最新写入的文件被保留');
+    ok(cache.set('toobig', Buffer.alloc(64)) === false, '单张超过上限不写缓存');
+    ok(cache.get('') === null, '空键读不到东西');
+    // 被外部截断成 0 字节：按未命中处理，不能把坏数据当成命中。
+    fs.writeFileSync(path.join(dir, 'broken.img'), Buffer.alloc(0));
+    ok(cache.get('broken') === null, '空文件按未命中处理');
+    const cleared = cache.clear();
+    ok(cleared >= 1 && cache.stats().files === 0, 'clear 清空缓存目录');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 

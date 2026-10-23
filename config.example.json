@@ -212,6 +212,8 @@
       "maxListCount": 100,
       "includeInPrompt": true,
       "promptMaxStickers": 8,
+      "cache": true,
+      "cacheMaxBytes": 67108864,
       "collect": {
         "enabled": true,
         "maxPerMinute": 2,

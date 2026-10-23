@@ -16,7 +16,8 @@ import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, render
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
-import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
+import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken, isLoopbackBase } from './dsh-client.js';
+import { discoverDshBaseUrls } from './dsh-discovery.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
@@ -26,6 +27,7 @@ import { normalizeImageForModel } from './media-normalize.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
+import { createStickerCache } from './sticker-cache.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -1386,6 +1388,20 @@ async function main() {
   const cfg = loadConfig();
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
+  // 表情图片本地缓存（state/sticker-cache）：QQ 图片 CDN（p.qpic.cn）到普通家宽的速率会在
+  // 50KB/s~3MB/s 之间波动，同一张 1.6MB 动图又常被重复发送。按表情 md5 缓存字节后，
+  // 第二次及以后直接发本地文件，既不慢也不会撞上下载超时。
+  // 关闭方式：socialV2.sticker.cache=false；上限：socialV2.sticker.cacheMaxBytes（默认 64MB）。
+  const stickerCache = cfg.socialV2?.sticker?.cache === false
+    ? null
+    : createStickerCache(path.join(STATE_DIR, 'sticker-cache'), {
+        maxBytes: (() => {
+          const n = Number(cfg.socialV2?.sticker?.cacheMaxBytes);
+          if (!Number.isFinite(n) || n <= 0) return 64 * 1024 * 1024;
+          return Math.min(512 * 1024 * 1024, Math.round(n));
+        })(),
+        logger: (message) => log(`[sticker] ${message}`)
+      });
   acquireLock();
   loadState();
 
@@ -1935,13 +1951,26 @@ async function main() {
       segments.push({ type: 'at', data: { qq: at } });
     }
     // 在桥接内完成带 DNS 固定、逐跳校验和大小限制的下载；不能把 URL 交给网关重新抓取。
-    let image;
-    try {
-      image = await safeFetchBuffer(url, MAX_MEDIA_BYTES);
-    } catch (error) {
-      throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
+    // 先查本地缓存（键 = 表情 md5，内容不可变）：命中就不必再走一次 QQ CDN，
+    // 慢窗口下这条路径直接把「可能要十几秒」的下载变成一次本地读盘。
+    const cacheKey = String(entry.md5 || entry.id || '').trim();
+    let image = stickerCache?.get(cacheKey) ?? null;
+    let cached = Boolean(image);
+    // 缓存文件可能被外部截断/替换：不是有效图片就按未命中处理，重新下载。
+    if (image && (image.length > MAX_MEDIA_BYTES || !looksLikeImageBuffer(image))) {
+      image = null;
+      cached = false;
     }
-    segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
+    if (!image) {
+      try {
+        image = (await safeFetchBuffer(url, MAX_MEDIA_BYTES)).buffer;
+      } catch (error) {
+        throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
+      }
+      // 通过图片签名检查后才缓存下载结果。
+      if (looksLikeImageBuffer(image)) stickerCache?.set(cacheKey, image);
+    }
+    segments.push({ type: 'image', data: { file: 'base64://' + image.toString('base64') } });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -1981,7 +2010,7 @@ async function main() {
     const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
     stickerEntries = updated.entries;
     saveStickerStoreSafe();
-    return { entry: updated.entry, messageId: data?.message_id ?? null };
+    return { entry: updated.entry, messageId: data?.message_id ?? null, cached };
   }
 
   // 更新本地 AI 认知（含义/标签/用法）。
@@ -2887,12 +2916,93 @@ async function main() {
       }
     }
   };
+  // ── DSH 端口自动发现 ────────────────────────────────────────────────────────
+  //
+  // 桌面版 DSH 用 `--port 0` 启动，每次重启都换一个随机端口；config.json 里的
+  // `dsh.baseUrl` 是具体端口，于是 DSH 一重启桥接就连不上，日志表现为
+  // 「连上事件流后 0 帧」/ `fetch failed`（容易被误读成协议不匹配）。
+  //
+  // 本机地址连不上时探测，且 20 秒最多一次。先检查未鉴权指纹，再验证 Cookie RPC。
+  // 换地址后写回 config.json，下次启动就不用再探。
+  let dshDiscoveryAt = 0;
+  let dshDiscoveryRunning = false;
+
+  function persistDshBaseUrl(baseUrl) {
+    try {
+      const file = path.join(ROOT, 'config.json');
+      const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+      const obj = JSON.parse(raw);
+      obj.dsh = obj.dsh ?? {};
+      if (obj.dsh.baseUrl === baseUrl) return;
+      obj.dsh.baseUrl = baseUrl;
+      atomicWriteJson(file, obj);
+      log(`   已写回 config.json：dsh.baseUrl = ${baseUrl}`);
+    } catch (error) {
+      log(`   ⚠️ 写回 dsh.baseUrl 失败：${error?.message ?? error}`);
+    }
+  }
+
+  /** 检查候选地址是否接受当前凭据并支持 DSH settings RPC。 */
+  async function probeDshBase(baseUrl) {
+    const probe = new NodeApiClient(baseUrl, 4000, {
+      token: cfg.dsh.authToken,
+      tokenExplicit: cfg.dsh.authTokenExplicit === true,
+      header: cfg.dsh.authHeader,
+      prefix: cfg.dsh.authPrefix,
+      allowRemote: cfg.dsh.allowRemote === true
+    });
+    try {
+      await probe.settings.describe({});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** @returns {Promise<boolean>} 是否换到了新地址。 */
+  async function maybeRediscoverDsh() {
+    if (!isLoopbackBase(cfg.dsh.baseUrl)) return false;
+    if (dshDiscoveryRunning) return false;
+    const now = Date.now();
+    if (now - dshDiscoveryAt < 20000) return false;
+    dshDiscoveryAt = now;
+    dshDiscoveryRunning = true;
+    try {
+      const bases = await discoverDshBaseUrls({ exclude: [cfg.dsh.baseUrl], log });
+      for (const base of bases) {
+        if (!(await probeDshBase(base))) continue;
+        log(`🔎 探测到 DSH 新地址：${base}（原 ${cfg.dsh.baseUrl} 已失效）`);
+        cfg.dsh.baseUrl = base;
+        api.baseUrl = base.replace(/\/+$/, '');
+        // Cookie 与 authority（host:port）绑定，换端口必须重铸。
+        api.invalidateAuth();
+        persistDshBaseUrl(base);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      log(`DSH 端口探测失败：${error?.message ?? error}`);
+      return false;
+    } finally {
+      dshDiscoveryRunning = false;
+    }
+  }
+
   const checkDsh = async () => {
     let ok = false;
     try {
       await api.settings.describe({});
       ok = true;
     } catch {}
+    if (!ok) {
+      // DSH 可能换了端口：探到就更新地址并立刻重试一次
+      if (await maybeRediscoverDsh()) {
+        try {
+          await api.settings.describe({});
+          ok = true;
+        } catch {}
+      }
+    }
     if (ok) {
       await refreshMode();
       // DSH 起来后拉一次 preset 清单；DSH 重启（dshReady 由 false 变 true）时再拉一次。
@@ -5460,7 +5570,15 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getStickerImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
           try {
             const entry = await getStickerImageData(stickerId);
-            const fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES);
+            // 与发送共用同一份字节缓存：看图/发图都不必重复下载同一张表情。
+            const cacheKey = String(entry.md5 || entry.id || '').trim();
+            let image = stickerCache?.get(cacheKey) ?? null;
+            if (image && (image.length > MAX_MEDIA_BYTES || !looksLikeImageBuffer(image))) image = null;
+            if (!image) {
+              image = (await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES)).buffer;
+              if (looksLikeImageBuffer(image)) stickerCache?.set(cacheKey, image);
+            }
+            const fetched = { buffer: image };
             const dims = getImageDimensions(fetched.buffer);
             if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
               sendJson({ ok: false, error: `表情图片像素超限（${dims.width}x${dims.height}），已拒绝` }, 400);
@@ -5818,7 +5936,7 @@ async function main() {
             st.preSleepWaitAccumMs = 0;
             saveSocialV2State();
             scheduleReplyCheckV2(key);
-            log(`[sticker] 工具发送表情 ${key}: ${sent.entry?.id || stickerId}`);
+            log(`[sticker] 工具发送表情 ${key}: ${sent.entry?.id || stickerId}${sent.cached ? '（本地缓存）' : ''}`);
             appendActivity(`${key} [sticker] 工具发送表情：${label}`);
             sendJson({ ok: true, key, sticker: sent.entry, sent: 1, failed: 0, quoted: quotedInfo });
           } catch (error) {
@@ -10732,6 +10850,13 @@ async function main() {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
+    // 被忽略的私聊不安排“主动机会”：否则“别回复我”会退化成“隔一阵主动来找我”。
+    if (key.startsWith('private:')) {
+      const raw = cfg.socialV2?.ignoreSenders;
+      const ignored = (Array.isArray(raw) ? raw : (Array.isArray(raw?.private) ? raw.private : []))
+        .map((v) => String(v).trim());
+      if (ignored.includes(key.slice('private:'.length))) return;
+    }
     const st = getSocialV2State(key);
     if (st.proactiveTimer) return;
     const p = cfg.socialV2?.proactive ?? {};
@@ -10968,6 +11093,21 @@ async function main() {
         return;
       }
       // 其余 / 开头内容照常发给 DSH（DSH 的斜杠命令原样执行，如 /model）
+    }
+
+    // 忽略发送者（socialV2.ignoreSenders）：
+    //   - 数组形式 ["123"]              = 群聊和私聊都忽略；
+    //   - 对象形式 { private: [], groups: [] } = 按会话类型分别控制。
+    // 命中的消息直接丢弃：不投递、不唤醒、不进上下文，AI 不会顺手回复。
+    // 管理员斜杠命令在上面已经处理完，不受影响；挂起的提问/审批也已在更前面消费。
+    const ignoreCfg = cfg.socialV2?.ignoreSenders;
+    const idList = (v) => (Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : []);
+    const ignoreIds = Array.isArray(ignoreCfg)
+      ? idList(ignoreCfg)
+      : (kind === 'private' ? idList(ignoreCfg?.private) : idList(ignoreCfg?.groups));
+    if (ignoreIds.includes(String(event.user_id))) {
+      appendActivity(`${key} [忽略发送者] ${event.user_id}：${textContent.slice(0, 80)}`);
+      return;
     }
 
     // 二代仿真模式（reserved2）：唤醒调度

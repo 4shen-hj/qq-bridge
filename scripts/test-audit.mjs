@@ -26,6 +26,7 @@ const tests = [
   // （DSH 同一路 DeepSeek 搜索、Bing RSS 兜底、凭据优先级与端点安全；
   //  本轮新增：空结果 note 必须在写缓存之前生成，否则缓存命中丢掉提示）。
   'test-media-search.mjs',
+  'test-stickers.mjs', 'test-local-optimizations.mjs',
   // GitHub issue 回归：#22 模式 user 层优先 / #11/#19 回合判忙租约 / #29 机器人身份注入。
   'test-issue-regressions.mjs',
   // 二代「会话初始提示词」：只在首次唤醒注入、管理面隔离、损坏文件只读降级、

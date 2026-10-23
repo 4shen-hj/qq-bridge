@@ -182,6 +182,22 @@ const REQUEST_TIMEOUT_MS = 20000;
 // 把整个 20 秒总预算耗光。
 const ATTEMPT_TIMEOUT_MS = 8000;
 const MAX_ADDRESS_ATTEMPTS = 4;
+
+// ── 二进制（图片/表情）下载的时限：不能用「墙钟预算」，要用「空闲超时」 ──────────
+//
+// 文本抓取的目标是「拿到响应」，图片的目标是「把几 MB 传完」，两者时间尺度差一个量级。
+// 实测 QQ 图片 CDN（p.qpic.cn）到普通家宽的速率会在 50KB/s ~ 3MB/s 之间随时波动：
+// 一张 1.6MB 的动图快的时候 0.5 秒，慢的时候 16~35 秒。原来的 8 秒单地址墙钟会在
+// 「传输其实一直在正常推进」的时候把它砍断，换地址重试又从 0 字节开始（没有续传），
+// 于是 3~4 个地址全白跑，最终报「请求超时：p.qpic.cn（已尝试 N 个地址）」——
+// 用户看到的就是「有时候发不出表情」，而且错误文案还误导人去查 URL 是否失效。
+//
+// 所以二进制改成：只要还在**收到数据**就一直等，只有连续 MEDIA_STALL_TIMEOUT_MS 没有
+// 新数据（真正的死连接/黑洞）才判定失败并切换地址；另外用 MEDIA_ATTEMPT_TIMEOUT_MS
+// 和 MEDIA_REQUEST_TIMEOUT_MS 兜底，保证再慢也有上界（防止对端滴流吸血）。
+const MEDIA_STALL_TIMEOUT_MS = 12000;   // 连续这么久没有新数据 → 判定这条连接已死
+const MEDIA_ATTEMPT_TIMEOUT_MS = 60000; // 多地址切换时每次尝试的硬上限
+const MEDIA_REQUEST_TIMEOUT_MS = 90000; // 整轮（含切换地址）的总上限
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 function validateLimit(value, name) {
@@ -193,25 +209,52 @@ function validateLimit(value, name) {
  * 返回 `{ok:true,result}` 或 `{ok:false,error,retryable}`；retryable 只标记网络层失败
  * （连接失败/超时/正文中断），大小与图片签名等策略性拒绝不重试。
  */
-function attemptOnce(url, address, limit, binary, budgetMs) {
+function attemptOnce(url, address, limit, binary, budgetMs, stallMs = 0) {
   return new Promise((resolve) => {
     let settled = false;
     let req;
     let response;
+    let timer = null;     // 文本：整次尝试的墙钟预算；二进制：滚动复位的空闲超时
+    let hardTimer = null; // 二进制：单个地址的硬上限兜底
     const settle = (outcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(hardTimer);
       resolve(outcome);
     };
     const fail = (error, retryable) => settle({ ok: false, error, retryable: retryable === true });
     const done = (result) => settle({ ok: true, result });
-    const timer = setTimeout(() => {
-      const error = new Error(`请求超时：${url.hostname}`);
+    const abortWith = (message) => {
+      const error = new Error(message);
       fail(error, true);
       req?.destroy(error);
       response?.destroy();
-    }, budgetMs);
+    };
+    const stallMessage = `请求超时（连续 ${Math.round(stallMs / 1000)} 秒没有新数据）：${url.hostname}`;
+    // 二进制分两段计时：
+    //   ① 等响应头阶段 —— 沿用 8 秒上界（死地址/黑洞要快速放弃，好换下一个地址）；
+    //   ② 传输阶段 —— 收到响应头之后才开始滚动空闲计时，慢慢传多久都行，只要还在动。
+    // 文本：沿用原来的整次尝试墙钟预算（抓网页要的是「尽快拿到响应」，不是传完几 MB）。
+    const armStall = stallMs > 0
+      ? () => {
+          clearTimeout(timer);
+          timer = setTimeout(() => abortWith(stallMessage), stallMs);
+        }
+      : null;
+    if (armStall) {
+      const firstByteMs = Math.min(budgetMs, ATTEMPT_TIMEOUT_MS);
+      timer = setTimeout(
+        () => abortWith(`请求超时（${Math.round(firstByteMs / 1000)} 秒内没有收到响应）：${url.hostname}`),
+        firstByteMs
+      );
+      hardTimer = setTimeout(
+        () => abortWith(`请求超时（单个地址超过 ${Math.round(budgetMs / 1000)} 秒）：${url.hostname}`),
+        budgetMs
+      );
+    } else {
+      timer = setTimeout(() => abortWith(`请求超时：${url.hostname}`), budgetMs);
+    }
     const mod = url.protocol === 'https:' ? https : http;
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
     try {
@@ -228,9 +271,13 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
         },
         servername: url.protocol === 'https:' && !net.isIP(hostname) ? hostname : undefined,
         rejectUnauthorized: url.protocol === 'https:',
-        timeout: budgetMs,
+        // socket 的 timeout 本身就是「空闲多久」语义：二进制用它做空闲检测，
+        // 文本仍用整次预算（与下面的墙钟计时器保持一致）。
+        timeout: stallMs > 0 ? stallMs : budgetMs,
       }, (res) => {
         response = res;
+        // 响应头到了 = 地址是活的，后段改由「空闲超时」接管（大图慢慢传也不会被砍）。
+        armStall?.();
         res.on('error', (error) => fail(error, true));
         res.on('aborted', () => fail(new Error('响应体读取中断'), true));
         res.on('close', () => {
@@ -259,6 +306,8 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
         };
         res.on('data', (chunk) => {
           if (settled) return;
+          // 还在收数据 → 空闲计时器复位（慢但一直在动的下载不能被误杀）。
+          armStall?.();
           if (!binary) { appendText(decoder.write(chunk)); return; }
           size += chunk.length;
           if (size > limit) {
@@ -278,10 +327,7 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
         });
       });
       req.on('timeout', () => {
-        const error = new Error(`请求超时：${url.hostname}`);
-        fail(error, true);
-        req.destroy(error);
-        response?.destroy();
+        abortWith(stallMs > 0 ? stallMessage : `请求超时：${url.hostname}`);
       });
       req.on('error', (error) => fail(error, true));
       req.end();
@@ -295,24 +341,27 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
 /**
  * 依次尝试已校验的地址（IPv4 优先，见 orderAddresses）。
  *
- * 单地址时沿用原来的「整个 20 秒总预算」，多地址时才启用单次尝试预算与失败切换：
- * 这样「只有一个地址、对方慢慢滴流」仍然会等满总时限（由总 deadline 兜底），
- * 而「第一个地址是坏的 IPv6」不会再白等 20 秒。
+ * 文本：单地址时沿用原来的「整个 20 秒总预算」，多地址时才启用单次尝试预算与失败切换 ——
+ * 「只有一个地址、对方慢慢滴流」仍然会等满总时限，而「第一个地址是坏的 IPv6」不用白等 20 秒。
+ * 二进制：见上方常量说明，改成空闲超时 + 90 秒整轮兜底，慢但还在动的大图不再被 8 秒砍断。
  * 所有地址都失败时抛最后一个错误（保留原始错误文案，便于日志排查）。
  */
 async function requestOnce(url, addresses, limit, binary = false) {
   const list = (Array.isArray(addresses) ? addresses : [addresses]).filter(Boolean);
   if (!list.length) throw new Error(`没有可用地址：${url.hostname}`);
-  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+  const totalMs = binary ? MEDIA_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+  const attemptCapMs = binary ? MEDIA_ATTEMPT_TIMEOUT_MS : ATTEMPT_TIMEOUT_MS;
+  const stallMs = binary ? MEDIA_STALL_TIMEOUT_MS : 0;
+  const deadline = Date.now() + totalMs;
   let lastError = null;
   const attempts = Math.min(list.length, MAX_ADDRESS_ATTEMPTS);
   for (let i = 0; i < attempts; i += 1) {
     const remaining = deadline - Date.now();
     if (remaining <= 250) break;
     const budget = list.length === 1
-      ? REQUEST_TIMEOUT_MS
-      : Math.min(ATTEMPT_TIMEOUT_MS, remaining);
-    const outcome = await attemptOnce(url, list[i], limit, binary, budget);
+      ? totalMs
+      : Math.min(attemptCapMs, remaining);
+    const outcome = await attemptOnce(url, list[i], limit, binary, budget, stallMs);
     if (outcome.ok) return outcome.result;
     lastError = outcome.error;
     if (!outcome.retryable) throw outcome.error;
