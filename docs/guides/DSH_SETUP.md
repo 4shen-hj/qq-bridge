@@ -106,6 +106,8 @@ DSH 的 DeepSeek Messages 适配器会拒绝非法的 tool-call 参数 JSON，�
 
 重试耗尽后，桥接在 `reserved` 和 `reserved2` 模式下静默处理已识别的工具参数 JSON 格式错误。其他回合错误仍给出普通失败提示，原始错误不会发送到 QQ。本地日志保留脱敏诊断。错误和中止回合释放忙状态，但不累计“无行动”或“未设置唤醒”惩罚，也不自动确认未读消息。有效唤醒配置保持不变；如果本次唤醒已消耗唯一的定时器，结束后没有任何唤醒途径，则恢复默认唤醒配置并保留行为计数，不重新投递失败回合。
 
+更新唤醒工具说明后，模型只需提交变化的配置字段。省略 `triggers.keywords` 保留原列表，传 `[]` 清空；配置不变时，在完成观察后用 `qq_mark_read` 和已查看的 `throughSeq` 收尾。预设更新后运行 `node scripts/build-agent-preset-patches.mjs`，并确认运行中的 DSH 已加载更新的预设和 MCP 工具说明。
+
 ## 验证是否装好
 
 离线安全回归：`node scripts/test-audit-setup.mjs` 与 `node scripts/test-audit-setup-guards.mjs`。后者直接执行两套 preset 的限制插件，验证本地工具、未声明工具与裸 `web_fetch` / `web_search` 被拒绝，而带 SSRF 防护的 `mcp__web-search-safe__*` 仍然可用。更新 preset 后需重新运行安装脚本并重启 DSH，现有 DSH 安装中的旧副本才会更新。

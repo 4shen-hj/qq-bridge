@@ -652,7 +652,7 @@ server.tool(
 
 server.tool(
   'qq_set_wake_config',
-  '设置指定会话的二代唤醒配置：mode/无限期或有限时间/提前唤醒条件（@、名字、关键词、提问、拍一拍、概率、anyMessage、指定成员）。triggers.speakerIds 是可选的“指定群友发言唤醒”：填一个或多个群友 QQ 号后，只要其中任意一位在群里发言就会唤醒你；不设置则不启用。适合在等某个人回复、或某人反应慢怕错过时使用。triggers.poke 开启后，群里有人拍一拍（包括拍你或拍别人）会唤醒你。注意：每次设置潜水/下一次唤醒前需先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可设置并沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与可直接设置并沉睡；若你参与了回复，则下次想睡需重新等待观察窗口。',
+  '设置指定会话的二代唤醒配置：mode/无限期或有限时间/提前唤醒条件（@、名字、关键词、提问、拍一拍、概率、anyMessage、指定成员）。只传需要修改的字段。关键词不变时省略 triggers.keywords，保留原列表，不要重抄；清空关键词才传 []。配置不变时，完成沉睡前观察后用 qq_mark_read(throughSeq=读到的水位) 收尾。triggers.speakerIds 是可选的“指定群友发言唤醒”：填一个或多个群友 QQ 号后，只要其中任意一位在群里发言就会唤醒你；不设置则不启用。适合在等某个人回复、或某人反应慢怕错过时使用。triggers.poke 开启后，群里有人拍一拍（包括拍你或拍别人）会唤醒你。注意：每次设置潜水/下一次唤醒前需先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可设置并沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与可直接设置并沉睡；若你参与了回复，则下次想睡需重新等待观察窗口。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -666,14 +666,14 @@ server.tool(
         atMention: z.boolean().optional().describe('被 @ 或引用自己时唤醒'),
         nameMention: z.boolean().optional().describe('被叫名字/昵称时唤醒'),
         speakerIds: z.array(z.union([z.number(), z.string()])).max(20).optional().describe('指定群友 QQ 号数组：这些群友中任意一位发言时唤醒（可选，最多 20 个，不设置则不启用；私聊不适用，设置会被桥接清除；可从 qq_get_active_members / qq_get_group_members / qq_get_message_detail 的 userId/user_id 获取）'),
-        keywords: z.array(z.string()).optional().describe('出现任意关键词时唤醒'),
+        keywords: z.array(z.string()).optional().describe('出现任意关键词时唤醒。省略则保留原列表，不变时不要重抄；只有修改关键词才传完整的新列表，[] 表示清空'),
         question: z.boolean().optional().describe('被直接提问/点名挑战时唤醒'),
         poke: z.boolean().optional().describe('有人拍一拍时唤醒（群聊包括拍你和拍别人，私聊为对方拍你）'),
         anyMessage: z.boolean().optional().describe('任意新消息都唤醒（活跃模式）'),
         probability: z.number().optional().describe('普通消息按该概率随机唤醒（0~1）')
       }).optional(),
       batchWindowMs: z.number().optional().describe('多条消息合并唤醒窗口（毫秒，>=1000）')
-    }).describe('要设置的唤醒配置，缺省字段保留原值')
+    }).describe('只传需要修改的字段，缺省字段保留原值；mode 的活跃/潜水规则仍会归一化 anyMessage 和睡眠时间。关键词不变时省略 triggers.keywords，清空才传 []；配置不变则完成观察后用 qq_mark_read 收尾')
   },
   async ({ key, token, config, throughSeq }) => {
     try {

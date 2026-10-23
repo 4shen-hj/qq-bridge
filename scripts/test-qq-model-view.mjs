@@ -7,6 +7,7 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { compactModelMessage, compactModelData, serializeModelData } from '../src/qq-model-view.js';
+import { bridgeHarness } from './audit-bridge-harness.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const shortMessage = {
@@ -170,6 +171,15 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
       assert.equal(schema.properties.throughSeq.maximum, Number.MAX_SAFE_INTEGER);
       assert.equal(schema.required.includes('throughSeq'), false);
     }
+    const wakeTool = listed.tools.find((tool) => tool.name === 'qq_set_wake_config');
+    const wakeConfig = wakeTool.inputSchema.properties.config;
+    assert.match(wakeTool.description, /只传需要修改的字段/);
+    assert.match(wakeTool.description, /关键词不变时省略 triggers\.keywords/);
+    assert.match(wakeTool.description, /配置不变时[^。]*观察后用 qq_mark_read\(throughSeq=/);
+    assert.match(wakeConfig.description, /只传需要修改的字段/);
+    assert.match(wakeConfig.description, /归一化 anyMessage 和睡眠时间/);
+    assert.match(wakeConfig.properties.triggers.properties.keywords.description, /省略则保留原列表/);
+    assert.match(wakeConfig.properties.triggers.properties.keywords.description, /\[\] 表示清空/);
     const waitSchema = listed.tools.find((tool) => tool.name === 'qq_wait_for_messages').inputSchema;
     assert.deepEqual(waitSchema.properties.purpose.enum, ['messages', 'reply']);
     assert.equal(waitSchema.required.includes('purpose'), false);
@@ -223,6 +233,11 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     assert.deepEqual(requests.at(-1).body, { key: common.key, config: { mode: 'diving' }, throughSeq: 0 });
     await client.callTool({ name: 'qq_set_wake_config', arguments: { ...common, config: { mode: 'active' } } });
     assert.deepEqual(requests.at(-1).body, { key: common.key, config: { mode: 'active' } });
+    for (const config of [{ triggers: { probability: 0.05 } }, { triggers: { keywords: [] } }]) {
+      const result = await client.callTool({ name: 'qq_set_wake_config', arguments: { ...common, config, throughSeq: 21 } });
+      assert.notEqual(result.isError, true);
+      assert.deepEqual(requests.at(-1).body, { key: common.key, config, throughSeq: 21 });
+    }
 
     for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '21']) {
       const before = requests.length;
@@ -242,5 +257,45 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
       assert.ok(path.basename(resolved).startsWith('.tmp-model-view-test-'));
       await fs.rm(resolved, { recursive: true, force: true });
     }
+  }
+});
+
+test('wake endpoint preserves omitted keywords and clears an explicit empty list', async () => {
+  const h = await bridgeHarness();
+  h.setMode('reserved2');
+  const key = 'group:456';
+  const st = h.getSocialV2State(key);
+  st.lastIncomingAt = Date.now() - 600000;
+  const server = h.startConsoleServer();
+  try {
+    if (!server.listening) await new Promise((resolve) => server.once('listening', resolve));
+    const update = async (config) => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/api/socialV2/wake-config`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-console-token': 'fixture-console-token', 'x-agent-token': st.agentToken },
+        body: JSON.stringify({ key, config })
+      });
+      const data = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(data));
+      return data.wakeConfig;
+    };
+    const keywords = ['战锤', '星际争霸'];
+    await update({ mode: 'diving', infinite: true, triggers: { atMention: true, keywords } });
+    const patched = await update({ triggers: { probability: 0.05 } });
+    assert.deepEqual(patched.triggers.keywords, keywords);
+    assert.equal(patched.triggers.probability, 0.05);
+    assert.equal(patched.triggers.atMention, true);
+    const cleared = await update({ triggers: { keywords: [] } });
+    assert.deepEqual(cleared.triggers.keywords, []);
+    assert.equal(cleared.triggers.probability, 0.05);
+    const active = await update({ mode: 'active' });
+    assert.equal(active.triggers.anyMessage, true);
+    const diving = await update({ mode: 'diving' });
+    assert.equal(diving.triggers.anyMessage, false);
+    assert.equal(h.calls.sent.length, 0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await h.close();
   }
 });

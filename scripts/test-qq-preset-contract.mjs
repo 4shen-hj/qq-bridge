@@ -56,6 +56,17 @@ test('one closing action can acknowledge the read watermark after the full obser
   assert.match(prefix, /若你参与回复[^。]*重新观察/);
 });
 
+test('wake updates use changed fields and unchanged config closes with a read watermark', () => {
+  assert.match(prefix, /只传需要修改的字段/);
+  assert.match(prefix, /关键词不变时省略 triggers\.keywords[^。]*不要重抄/);
+  assert.match(prefix, /清空才传 \[\]/);
+  assert.match(prefix, /mode[^。]*归一化 anyMessage 和睡眠时间/);
+  assert.match(prefix, /观察已完成且配置不变时[^。]*qq_mark_read\(throughSeq=[^。]*不要重复 set_wake_config/);
+  const example = prefix.match(/例如只改普通消息概率，config 只传 ([^。]+)。/);
+  assert.ok(example, 'the model needs a partial config example');
+  assert.deepEqual(JSON.parse(example[1]), { triggers: { probability: 0.05 } });
+});
+
 test('pre-reply quiet checks, waiting for replies and pre-sleep observation have distinct instructions', () => {
   assert.match(prefix, /先理解并处理当前消息/);
   assert.match(prefix, /【首答前】[^\n]*qq_wait_for_messages\(purpose="reply", quietMs=10000\)/);
