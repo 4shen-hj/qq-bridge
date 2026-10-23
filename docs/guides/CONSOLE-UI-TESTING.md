@@ -40,14 +40,15 @@ node scripts/test-preset-console-ui.mjs
 覆盖范围：
 
 - 改造前 225 个元素 ID 保留，DOM ID 唯一。
-- 九个导航视图及切换后草稿保留，跨越实际的 3 秒状态轮询。
+- 十个导航视图及切换后草稿保留，跨越实际的 3 秒状态轮询。
 - 模式及预设、角色创建与切换、静默模式、白名单、安全设置。
 - 二代配置上下两个保存按钮的完整 payload，时间单位、零值、工具开关、暂停及恢复。
 - 一代社交参数与会话阶段。
 - 黑话添加、搜索、标签切换、确认对话框与学习参数。
 - 测试消息、AI 提醒仅发送到 mock API。
-- 全部 24 次写请求与改造前的 API payload 基线逐项完全比较。
-- 手机 390px 与平板 768px 下九个视图没有页面级横向溢出。
+- 核心表单与权限检查的 25 次写请求逐项完整比较，包括请求顺序、方法、路径和嵌套 payload。
+- 用量图表切换时间范围后等待对应数据渲染；受控乱序请求验证旧响应和旧错误不能覆盖当前图表，同范围的慢轮询也能正常显示。
+- 手机 390px 与平板 768px 下十个视图没有页面级横向溢出。
 - 深色模式：切换生效、写入 `localStorage`、刷新后保持、`aria-pressed` 与 `color-scheme` 同步、正文对比度 ≥ 7:1、深色下 390 / 768px 无横向溢出。
 - 未做选择时跟随系统 `prefers-color-scheme`。
 - `prefers-reduced-motion: reduce` 下关闭背景动效、页面切换动画与过渡。
@@ -62,11 +63,14 @@ node scripts/test-preset-console-ui.mjs
 
 ## 基线说明
 
-`console-ui-legacy-ids.json` 保存改造前的 225 个元素 ID。`console-ui-contracts.json` 来自原控制台在相同 fixture 中执行相同操作后的 24 次写请求，包含二代配置的完整嵌套参数。
+`console-ui-legacy-ids.json` 保存改造前的 225 个元素 ID。`console-ui-contracts.json` 保留原控制台的 24 次表单写请求，包含二代配置的完整嵌套参数。
 
-只有后端契约经过明确调整时才更新基线。`scripts/fixtures/console.before.html` 是改造前的原版控制台（通常无需改动），重录时运行：
+当前控制台以这份历史基线为基础，明确补入已经由后端支持的两项变化。安全设置之后新增一次 `POST /api/security`，请求体为 `{ "rehardenStateDir": true }`。上下两个二代保存按钮的 `tools` 对象都包含 `sendVoice: true`，这个值来自离线演示配置，不代表生产默认值。测试对全部 25 次请求做深度相等比较，不删除实际请求或忽略新增字段。后续人格、提示词等交互另有逐步断言。
+
+修改 API 时，先核对后端路由，再调整测试中的预期变化。保留历史基线，避免把当前页面的输出直接录成正确答案。`scripts/fixtures/console.before.html` 保存改造前的原版控制台。以下命令只验证或重录历史基线，不运行当前页面新增功能的测试：
 
 ```sh
+node scripts/test-console-ui.mjs --original
 node scripts/test-console-ui.mjs --original --record-baseline
 ```
 

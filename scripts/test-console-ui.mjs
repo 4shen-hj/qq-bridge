@@ -147,7 +147,7 @@ try {
   // state/ 的 ACL 收紧需要管理员权限，未提权时桥接会明确报告 hardened:false。
   // 控制台必须把这件事**显式**呈现（含可复制的提权命令），而不是让用户以为已经安全；
   // 用户按提示处理后点「重新检测」应当转为成功态。
-  await test('Unhardened state directory surfaces a warning with the exact command', async () => {
+  if (!original) await test('Unhardened state directory surfaces a warning with the exact command', async () => {
     await navigate('access');
     await page.waitForFunction(() => document.getElementById('stateDirWarn')?.style.display !== 'none');
     const shown = await page.evaluate(() => ({
@@ -156,8 +156,6 @@ try {
     }));
     assert.match(shown.path, /state/, '应当显示 state 目录路径');
     assert.match(shown.cmd, /icacls/, '应当给出可复制的提权命令');
-    // 只验证按钮确实发起「重新检测」请求，**不**写进/触发 baseline 的写载荷契约
-    // （baseline 记录的是改版前控制台的表单写载荷，这条不算表单写）。
     await page.waitForFunction(() => document.getElementById('stateDirReharden') !== null);
     const [request] = await Promise.all([
       page.waitForRequest(r => new URL(r.url()).pathname === '/api/security' && r.method() === 'POST'),
@@ -248,8 +246,20 @@ try {
     assert(results.every(x => x.ok), 'Cannot record a baseline from a failed suite');
     await writeFile(baselinePath, JSON.stringify(fixture.requests, null, 2) + '\n');
     console.log(`Recorded original API contracts: ${baselinePath}`);
-  } else await test('All submitted payloads exactly match the pre-redesign console baseline', async () => {
+  } else await test('Core form and security payloads exactly match reviewed API contracts', async () => {
     const expected = JSON.parse(await readFile(baselinePath, 'utf8'));
+    assert.equal(expected.length, 24, 'The historical baseline contains 24 form writes');
+    if (!original) {
+      const securityIndex = expected.findIndex(request => request.path === '/api/security');
+      assert.deepEqual(expected[securityIndex], { method: 'POST', path: '/api/security', body: { interceptNotify: false } });
+      expected.splice(securityIndex + 1, 0, { method: 'POST', path: '/api/security', body: { rehardenStateDir: true } });
+      const configWrites = expected.filter(request => request.method === 'POST' && request.path === '/api/socialV2/config');
+      assert.equal(configWrites.length, 2, 'Both complete configuration saves include the voice tool switch');
+      for (const request of configWrites) {
+        assert.equal(Object.hasOwn(request.body.tools, 'sendVoice'), false, 'The historical console predates the voice tool switch');
+        request.body.tools.sendVoice = true;
+      }
+    }
     assert.deepEqual(fixture.requests, expected);
   });
 
@@ -320,13 +330,13 @@ try {
     // 切范围：重新请求并按生产同一套桶宽阶梯换粒度
     // （24h→30min / 3d→2h / 7d→6h / 30d→24h，桶数始终 ≤ 48）
     await page.click('#usageChartControls [data-usage-hours="168"]');
-    await page.waitForFunction(() => /每格 \d+ 分钟/.test(document.getElementById('usageChartHint')?.textContent || '')
+    await page.waitForFunction(() => /每格 360 分钟/.test(document.getElementById('usageChartHint')?.textContent || '')
       && document.querySelector('#usageChartControls [data-usage-hours="168"]')?.classList.contains('active'));
     assert.match(await page.textContent('#usageChartHint'), /每格 360 分钟/, '切到 7 天后桶宽变成 6 小时');
 
     // 粗桶会把高峰窗口整个包在中间 → 必须标『跨时段』（细桶边界对齐则不会，这也是真账本的行为）
     await page.click('#usageChartControls [data-usage-hours="720"]');
-    await page.waitForFunction(() => /每格 \d+ 分钟/.test(document.getElementById('usageChartHint')?.textContent || '')
+    await page.waitForFunction(() => /每格 1440 分钟/.test(document.getElementById('usageChartHint')?.textContent || '')
       && document.querySelector('#usageChartControls [data-usage-hours="720"]')?.classList.contains('active'));
     assert.match(await page.textContent('#usageChartHint'), /每格 1440 分钟/, '切到 30 天后桶宽变成 24 小时');
     const coarse = await page.evaluate(() => ({
@@ -345,7 +355,101 @@ try {
 
     // 回到 24 小时，避免影响后续断言
     await page.click('#usageChartControls [data-usage-hours="24"]');
-    await page.waitForFunction(() => document.querySelector('#usageChartControls [data-usage-hours="24"]')?.classList.contains('active'));
+    await page.waitForFunction(() => /每格 30 分钟/.test(document.getElementById('usageChartHint')?.textContent || '')
+      && document.querySelector('#usageChartControls [data-usage-hours="24"]')?.classList.contains('active'));
+  });
+
+  if (!original) await test('Token usage chart ignores stale success and failure without starving slow polls', async () => {
+    const chartPage = await context.newPage();
+    chartPage.setDefaultTimeout(8000);
+    const heldRoutes = new Set();
+    const seriesPattern = `${fixture.url}/api/tokens/series?*`;
+    let nextRoute;
+    await chartPage.addInitScript(() => { window.setInterval = () => 0; });
+    chartPage.on('pageerror', error => errors.push(error.message));
+    chartPage.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
+    try {
+      await chartPage.goto(fixture.url);
+      await chartPage.locator('[data-view="usage"]').first().click();
+      await chartPage.waitForFunction(() => /每格 30 分钟/.test(document.getElementById('usageChartHint')?.textContent || ''));
+      await chartPage.evaluate(() => {
+        window.chartRefreshOriginal = refreshUsageChart;
+        window.chartRefreshCalls = [];
+        refreshUsageChart = (...args) => {
+          const completion = window.chartRefreshOriginal(...args);
+          window.chartRefreshCalls.push(completion);
+          return completion;
+        };
+      });
+      await chartPage.route(seriesPattern, route => {
+        heldRoutes.add(route);
+        nextRoute?.(route);
+      });
+      async function startRead(hours) {
+        const index = await chartPage.evaluate(() => window.chartRefreshCalls.length);
+        let timeout;
+        const arrived = new Promise((resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error('Controlled chart request did not arrive')), 8000);
+          nextRoute = resolve;
+        });
+        try {
+          if (hours) await chartPage.click(`#usageChartControls [data-usage-hours="${hours}"]`);
+          else await chartPage.evaluate(() => { refreshUsageChart(); });
+          const route = await arrived;
+          return async ({ invalid = false, symbol } = {}) => {
+            const response = await route.fetch();
+            const body = await response.json();
+            if (symbol) body.symbol = symbol;
+            await route.fulfill({ response, body: invalid ? '{' : JSON.stringify(body) });
+            heldRoutes.delete(route);
+            await chartPage.evaluate(i => window.chartRefreshCalls[i], index);
+          };
+        } finally {
+          clearTimeout(timeout);
+          nextRoute = null;
+        }
+      }
+      async function assertCurrent(hours, minutes, metric) {
+        assert.equal(await chartPage.locator('#usageChartControls [data-usage-hours].active').getAttribute('data-usage-hours'), String(hours));
+        assert.match(await chartPage.textContent('#usageChartHint'), new RegExp(`每格 ${minutes} 分钟`));
+        assert.equal(await chartPage.locator('#usageChartControls [data-usage-metric].active').getAttribute('data-usage-metric'), metric);
+        assert.equal(await chartPage.locator('#usageChart svg').count(), 1, '过期响应不能删除当前走势图');
+        assert.equal(await chartPage.locator('#usageChart svg').getAttribute('aria-label'), `${metric === 'tokens' ? 'token' : '花费'}随时间的走势图`);
+      }
+      const oldRange = await startRead(168);
+      const selectedRange = await startRead(720);
+      await chartPage.click('#usageChartControls [data-usage-metric="tokens"]');
+      await selectedRange();
+      await assertCurrent(720, 1440, 'tokens');
+      await oldRange();
+      await assertCurrent(720, 1440, 'tokens');
+
+      const staleFailure = await startRead(168);
+      const currentSuccess = await startRead(720);
+      await chartPage.click('#usageChartControls [data-usage-metric="cost"]');
+      await currentSuccess();
+      await staleFailure({ invalid: true });
+      await assertCurrent(720, 1440, 'cost');
+
+      const oldestPoll = await startRead();
+      const firstCompletion = await startRead();
+      const newestPoll = await startRead();
+      await firstCompletion({ symbol: '$' });
+      assert.match(await chartPage.textContent('#usageChartTotal'), /^\$/, '完成的轮询应可显示，即使更新的轮询尚未完成');
+      await newestPoll({ symbol: '€' });
+      assert.match(await chartPage.textContent('#usageChartTotal'), /^€/, '更新的轮询完成后应显示其数据');
+      await oldestPoll({ symbol: '¥' });
+      assert.match(await chartPage.textContent('#usageChartTotal'), /^€/, '同一时间范围的旧响应不能覆盖已显示的新响应');
+      await assertCurrent(720, 1440, 'cost');
+    } finally {
+      for (const route of heldRoutes) await route.continue().catch(() => {});
+      await chartPage.unroute(seriesPattern);
+      await chartPage.evaluate(async () => {
+        await Promise.allSettled(window.chartRefreshCalls || []);
+        if (window.chartRefreshOriginal) refreshUsageChart = window.chartRefreshOriginal;
+      }).catch(() => {});
+      await chartPage.close();
+    }
   });
 
   if (!original) await test('Mobile and tablet layouts have no document-level horizontal overflow', async () => {

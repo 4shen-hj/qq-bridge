@@ -4628,6 +4628,8 @@ document.getElementById('consoleTokenInput').after(tokenToggle);
 let usageChartHours = 24;
 let usageChartMetric = 'cost';
 let usageChartData = null;
+let usageChartRequestId = 0;
+let usageChartAppliedRequestId = 0;
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 function svgEl(name, attrs = {}) {
@@ -4753,10 +4755,16 @@ function renderUsageChart(series) {
 }
 
 async function refreshUsageChart() {
+  const hours = usageChartHours;
+  const requestId = ++usageChartRequestId;
   try {
-    const r = await api(`/api/tokens/series?hours=${usageChartHours}`);
+    const r = await api(`/api/tokens/series?hours=${hours}`);
+    if (hours !== usageChartHours || requestId < usageChartAppliedRequestId) return;
+    usageChartAppliedRequestId = requestId;
     renderUsageChart(r);
   } catch (error) {
+    if (hours !== usageChartHours || requestId < usageChartAppliedRequestId) return;
+    usageChartAppliedRequestId = requestId;
     document.getElementById('usageChart').textContent = `走势读取失败：${error?.message || '未知错误'}`;
   }
 }
