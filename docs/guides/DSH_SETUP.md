@@ -108,6 +108,16 @@ DSH 的 DeepSeek Messages 适配器会拒绝非法的 tool-call 参数 JSON，�
 
 更新唤醒工具说明后，模型只需提交变化的配置字段。省略 `triggers.keywords` 保留原列表，传 `[]` 清空；配置不变时，在完成观察后用 `qq_mark_read` 和已查看的 `throughSeq` 收尾。预设更新后运行 `node scripts/build-agent-preset-patches.mjs`，并确认运行中的 DSH 已加载更新的预设和 MCP 工具说明。
 
+## 控制模型输入中的重复说明
+
+二代预设保存完整的行为、安全与收尾协议。MCP 工具总说明只介绍用途和必要前置条件，参数细则放在对应 schema 字段。每轮唤醒保留会话令牌、身份、角色名、动态等待数值、消息时间、状态和记忆，不再重复整段参与策略、表情策略与等待教程。
+
+完整角色卡由 `qq_get_prompt` 提供。首次进入、角色变化、当前上下文缺少人设或需要刷新配置时读取；仅需当前状态时用 `qq_social_state`。角色没有新增“读过就永远省略”的缓存，管理员仍可更新角色。工具名、参数结构、开关、权限检查及发送/已读/等待逻辑保持不变。
+
+运行 `node scripts/probe-model-input.mjs --output before.json` 可用隔离的 MCP `tools/list` 和合成会话保存输入大小。改动后运行 `node scripts/probe-model-input.mjs --compare before.json --output after.json`，会比较字符数、UTF-8 字节数，并验证去掉说明后的工具声明是否一致。脚本不读取生产配置或调用业务工具；统计不包含历史、其他 MCP、provider 包装或模型分词，不能换算成费用或延迟降幅。
+
+修改后重新生成预设 patch，并重载 DSH 的 QQ MCP 插件与预设；桥接代码在下次启动时加载。已有会话历史不被改写，历史里的旧说明仍可能留在上下文中。
+
 ## 验证是否装好
 
 离线安全回归：`node scripts/test-audit-setup.mjs` 与 `node scripts/test-audit-setup-guards.mjs`。后者直接执行两套 preset 的限制插件，验证本地工具、未声明工具与裸 `web_fetch` / `web_search` 被拒绝，而带 SSRF 防护的 `mcp__web-search-safe__*` 仍然可用。更新 preset 后需重新运行安装脚本并重启 DSH，现有 DSH 安装中的旧副本才会更新。

@@ -173,12 +173,12 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     }
     const wakeTool = listed.tools.find((tool) => tool.name === 'qq_set_wake_config');
     const wakeConfig = wakeTool.inputSchema.properties.config;
-    assert.match(wakeTool.description, /只传需要修改的字段/);
-    assert.match(wakeTool.description, /关键词不变时省略 triggers\.keywords/);
-    assert.match(wakeTool.description, /配置不变时[^。]*观察后用 qq_mark_read\(throughSeq=/);
+    assert.match(wakeTool.description, /配置不变[^。]*观察后用 qq_mark_read\(throughSeq=/);
     assert.match(wakeConfig.description, /只传需要修改的字段/);
-    assert.match(wakeConfig.description, /归一化 anyMessage 和睡眠时间/);
+    assert.match(wakeConfig.description, /mode[^。]*anyMessage 和睡眠时间/);
+    assert.match(wakeConfig.properties.mode.description, /active[^；]*anyMessage=true、infinite=true[^；]*清除睡眠截止时间/);
     assert.match(wakeConfig.properties.triggers.properties.keywords.description, /省略则保留原列表/);
+    assert.match(wakeConfig.properties.triggers.properties.keywords.description, /不变时不要重抄/);
     assert.match(wakeConfig.properties.triggers.properties.keywords.description, /\[\] 表示清空/);
     const waitSchema = listed.tools.find((tool) => tool.name === 'qq_wait_for_messages').inputSchema;
     assert.deepEqual(waitSchema.properties.purpose.enum, ['messages', 'reply']);
