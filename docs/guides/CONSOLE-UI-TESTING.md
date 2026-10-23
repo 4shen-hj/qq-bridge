@@ -70,6 +70,16 @@ node scripts/test-preset-console-ui.mjs
 node scripts/test-console-ui.mjs --original --record-baseline
 ```
 
-普通回归不依赖 `console.before.html`。不要用真实的 `test-console.mjs` 替代本脚本：那个脚本可能向真实 QQ 发送消息。
+普通浏览器回归不依赖 `console.before.html`。`test-console.mjs` 验证后端 API，不能替代浏览器回归。
 
 此回归验证前端行为和提交契约，不能替代真实 QQ / DSH 集成测试。
+
+## 后端 API 隔离回归
+
+运行 `npm run test-console`。脚本在临时目录内运行真实桥接的控制台路由，网关与 DSH 均为模拟对象，不读取真实 `config.json` 或 `state/`。测试结束或请求失败时，脚本在 `finally` 中恢复配置和角色文件的原始字节及存在性，再删除临时目录。
+
+运行 `node scripts/test-console-safety.mjs` 验证字段缺失、断言失败、网络失败和命令行开关。该脚本的实时模式检查也只连接临时模拟端点。
+
+连接已经运行的真实控制台需要显式提供 `--live --base <控制台地址>`，并设置环境变量 `QQ_CONSOLE_TEST_TOKEN`。此模式只读取角色、会话、挂起项目和名单，不修改配置、角色或会话。
+
+只有再加上 `--live-send --kind group|private --target <明确的QQ号码>`，脚本才调用一次真实发送接口。目标必须已经通过控制台的权限检查，脚本不会临时加入白名单。发送失败会使测试失败，不会把网关不可达算作通过。
