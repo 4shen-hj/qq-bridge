@@ -1738,6 +1738,8 @@ async function main() {
    * 所以音量必须在本地用 ffmpeg 调好再发（临时文件发完即删）。
    */
   async function sendVoiceV2(key, filePath, { guard = false, audit = true, audio = null } = {}) {
+    const assertSendAllowed = guard ? captureSendGuard(key) : null;
+    assertSendAllowed?.();
     const vc = voiceCfg();
     // 注意：这里**不检查** vc.enabled —— 那是「AI 能不能发语音」的开关，判定放在
     // AI 路由（/api/socialV2/send-voice）与 sendVoiceForV2 里。底层只管发，
@@ -1749,6 +1751,7 @@ async function main() {
     } catch (error) {
       throw new Error(`音频检查失败：${error?.message ?? error}`);
     }
+    assertSendAllowed?.();
     if (!info.ok) throw new Error(`音频不可发送：${info.error}`);
 
     // 音量处理（默认原样 → 不产生临时文件）
@@ -1765,42 +1768,42 @@ async function main() {
     }
     const sendPath = processed.path;
 
-    const assertSendAllowed = guard ? captureSendGuard(key) : null;
-    const [kind, id] = key.split(':');
-    const recordSegment = { type: 'record', data: { file: sendPath } };
-    let resolveSend;
-    let rejectSend;
-    const sendPromise = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
-    sendChain = sendChain.then(async () => {
-      try {
-        if (assertSendAllowed) assertSendAllowed();
-        // 语音条比图片大、要过一次 SILK 转码，给 60s 预算（文本/图片共用同一 sendChain，
-        // 所以这条语音发完之前后面的文本会自然排队，不会插队到语音前面）。
-        const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-        const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
-        const params = kind === 'private'
-          ? { user_id: Number(id), message: [recordSegment] }
-          : { group_id: Number(id), message: [recordSegment] };
-        const res = await fetch(`${httpUrl}/${action}`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-          },
-          body: JSON.stringify(params),
-          signal: AbortSignal.timeout(60000)
-        });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
-          const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口）' : '';
-          throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
-        }
-        resolveSend(body.data);
-      } catch (error) {
-        rejectSend(error);
-      }
-    });
     try {
+      assertSendAllowed?.();
+      const [kind, id] = key.split(':');
+      const recordSegment = { type: 'record', data: { file: sendPath } };
+      let resolveSend;
+      let rejectSend;
+      const sendPromise = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
+      sendChain = sendChain.then(async () => {
+        try {
+          if (assertSendAllowed) assertSendAllowed();
+          // 语音条比图片大、要过一次 SILK 转码，给 60s 预算（文本/图片共用同一 sendChain，
+          // 所以这条语音发完之前后面的文本会自然排队，不会插队到语音前面）。
+          const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+          const params = kind === 'private'
+            ? { user_id: Number(id), message: [recordSegment] }
+            : { group_id: Number(id), message: [recordSegment] };
+          const res = await fetch(`${httpUrl}/${action}`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+            },
+            body: JSON.stringify(params),
+            signal: AbortSignal.timeout(60000)
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+            const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口）' : '';
+            throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
+          }
+          resolveSend(body.data);
+        } catch (error) {
+          rejectSend(error);
+        }
+      });
       const data = await sendPromise;
       return {
         messageId: data?.message_id ?? null,
@@ -8155,9 +8158,11 @@ async function main() {
   function captureSendGuard(key) {
     const policy = sessionPolicy(key);
     const sessionId = state.sessions[key];
+    const agentToken = socialV2.conversations.get(key)?.agentToken;
     return () => {
       if (!isSessionAllowedInCurrentMode(key) || policy !== sessionPolicy(key)
-          || (sessionId && state.sessions[key] !== sessionId)) {
+          || state.sessions[key] !== sessionId
+          || socialV2.conversations.get(key)?.agentToken !== agentToken) {
         throw new Error('发送已取消：会话、模式或白名单已变化');
       }
     };
