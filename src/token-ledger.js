@@ -19,9 +19,10 @@
 //    `pumpMux` 的 finally 会清掉所有 per-turn Map（否则重连后回复会重复累加）。
 //    所以每条采样一到就 append 到 JSONL 日志，内存只是它的投影。
 //
-// 存储：`state/token-usage.jsonl`，两种行：
+// 存储：`state/token-usage.jsonl`，三种行：
 //   {"k":"base", t, sid, key, seq, model, provider, b:{cacheMiss,cacheHit,cacheWrite,output,reasoning}}
 //   {"k":"turn", t, sid, key, seq, turn, step, retry, model, provider, b:{...}}
+//   {"k":"evict", sid, key, items:[[sampleKey,{seq,buckets,cost,tier,...}]], legacy}
 // 行数超过上限时按内存态重写（自动去重 + 丢弃被覆盖的旧采样）。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -117,7 +118,7 @@ export function createTokenLedger({
   const retryAxis = new Map();
   /** sessionId -> 最近一次见到的会话 key（会话退役后仍可归属到原 QQ 会话） */
   const sessionKeys = new Map();
-  /** sessionId -> 被淘汰（只剩累计值、无法再拆到某一轮）的采样汇总 */
+  /** sessionId -> 尚未被投影覆盖的淘汰采样及旧版累计桶 */
   const evicted = new Map();
   let evictedDirty = false;
   /** sessionId -> 最近一次活动时间 */
@@ -152,23 +153,16 @@ export function createTokenLedger({
     const t = Number.isFinite(Number(record.t)) ? Number(record.t) : 0;
     const buckets = normalizeUsage(record.b);
 
-    // 被淘汰的逐轮采样：只保留累计桶与花费，不保留回合归属。
     if (record.k === 'evict') {
-      const prevEvicted = evicted.get(sid);
-      if (prevEvicted && prevEvicted.dropped >= (Number(record.dropped) || 0)) return false;
-      evicted.set(sid, {
-        sessionId: sid,
-        key: record.key,
-        buckets,
-        cost: Number(record.cost) || 0,
-        byTier: {
-          peak: Number(record.peak) || 0,
-          off: Number(record.off) || 0
-        },
+      const items = new Map(Array.isArray(record.items) ? record.items : []);
+      const legacy = record.legacy ?? (Array.isArray(record.items) ? null : {
+        buckets, cost: Number(record.cost) || 0,
+        byTier: { peak: Number(record.peak) || 0, off: Number(record.off) || 0 },
         estimated: record.estimated === true,
-        dropped: Number(record.dropped) || 0,
-        maxSeq: Number.isFinite(Number(record.maxSeq)) ? Number(record.maxSeq) : -1
+        maxSeq: Number.isFinite(Number(record.maxSeq)) ? Number(record.maxSeq) : -1,
       });
+      evicted.set(sid, { sessionId: sid, key: record.key, items, legacy });
+      pruneEvictions(sid);
       if (t > (sessionSeen.get(sid) ?? 0)) sessionSeen.set(sid, t);
       return true;
     }
@@ -185,6 +179,7 @@ export function createTokenLedger({
         provider: record.provider,
         buckets
       });
+      pruneEvictions(sid);
       if (t > (sessionSeen.get(sid) ?? 0)) sessionSeen.set(sid, t);
       return true;
     }
@@ -195,11 +190,12 @@ export function createTokenLedger({
       const retry = Number.isFinite(Number(record.retry)) ? Number(record.retry) : 0;
       if (!Number.isFinite(turn) || !Number.isFinite(step)) return false;
       const sk = sampleKeyOf(sid, turn, step, retry);
-      const prev = samples.get(sk);
+      const prev = samples.get(sk) ?? evicted.get(sid)?.items.get(sk);
       // 幂等关键：只有 seq **严格更新**才允许覆盖。
       // 相等 seq 只可能是同一条事件的重放（重连时 snapshot 会重发），
       // 若放行「相等 seq 覆盖」，旧快照就能把新数据改小 —— 花费会凭空缩水。
       if (prev && seq >= 0 && prev.seq >= seq) return false;
+      evicted.get(sid)?.items.delete(sk);
       samples.set(sk, {
         sessionId: sid,
         key: record.key,
@@ -226,6 +222,8 @@ export function createTokenLedger({
     retryAxis.clear();
     sessionKeys.clear();
     sessionSeen.clear();
+    evicted.clear();
+    evictedDirty = false;
     journalLines = 0;
     droppedLines = 0;
     let raw;
@@ -288,8 +286,7 @@ export function createTokenLedger({
     for (const e of evicted.values()) {
       out.push({
         k: 'evict', t: sessionSeen.get(e.sessionId) ?? 0, sid: e.sessionId, key: e.key,
-        b: e.buckets, cost: e.cost, peak: e.byTier.peak, off: e.byTier.off,
-        estimated: e.estimated, dropped: e.dropped, maxSeq: Number(e.maxSeq) >= 0 ? Number(e.maxSeq) : -1
+        items: [...e.items], legacy: e.legacy
       });
     }
     try {
@@ -307,17 +304,6 @@ export function createTokenLedger({
     }
   }
 
-  /**
-   * 淘汰最旧的逐轮采样，把内存与磁盘都压在 maxLines 条以内。
-   *
-   * 为什么必须有淘汰：`compact()` 只是把内存态「重写」一遍 —— 如果内存本身无限增长，
-   * 那么一旦条数越过上限，**之后每一条采样**都会触发一次整文件同步重写（多 MB 的
-   * JSONL 写在 QQ 事件路径上），而且内存会一直涨。所以压缩必须真的丢东西。
-   *
-   * 关键：**丢明细不能丢总量**。被淘汰的采样先把桶累加进 `evicted`（连同它自己那一次的
-   * 计价结果），读取时照样算进权威累计；只是这些旧回合不再能拆到具体某一轮，控制台会
-   * 把它归进「未逐轮归属」。这样即使某个会话还没有投影基线，总量也依然精确。
-   */
   function evictOldestSamples() {
     const overflow = samples.size - maxLines;
     if (overflow <= 0) return 0;
@@ -325,28 +311,17 @@ export function createTokenLedger({
     for (let i = 0; i < overflow; i += 1) {
       const [sampleId, sample] = ordered[i];
       samples.delete(sampleId);
+      const base = baselines.get(sample.sessionId);
+      if (base && sample.seq <= base.seq) continue;
       const acc = evicted.get(sample.sessionId) ?? {
-        sessionId: sample.sessionId,
-        key: sample.key,
-        buckets: { ...ZERO_BUCKETS },
-        cost: 0,
-        byTier: { peak: 0, off: 0 },
-        estimated: false,
-        dropped: 0,
-        // 被淘汰采样里最大的 seq：一旦更新的投影基线覆盖到它，这些桶就已经包含在
-        // 基线里了，再相加就是重复计费（见 evictionCovered()）。
-        maxSeq: -1
+        sessionId: sample.sessionId, key: sample.key, items: new Map(), legacy: null,
       };
-      acc.buckets = addBuckets(acc.buckets, sample.buckets);
-      const sampleSeq = Number(sample.seq);
-      if (Number.isFinite(sampleSeq) && sampleSeq >= 0) {
-        acc.maxSeq = Math.max(Number(acc.maxSeq) >= 0 ? Number(acc.maxSeq) : -1, sampleSeq);
-      }
       const p = priceUsage(sample.buckets, { model: sample.model, at: sample.t || now(), table: priceTable });
-      acc.cost += p.cost.total;
-      acc.byTier[p.rates.tier] += p.cost.total;
-      acc.estimated ||= p.rates.estimated;
-      acc.dropped += 1;
+      acc.items.set(sampleId, {
+        seq: sample.seq, buckets: sample.buckets, cost: p.cost.total,
+        tier: p.rates.tier, estimated: p.rates.estimated,
+        model: sample.model, provider: sample.provider,
+      });
       if (sample.key) acc.key = sample.key;
       evicted.set(sample.sessionId, acc);
       evictedDirty = true;
@@ -354,20 +329,46 @@ export function createTokenLedger({
     return overflow;
   }
 
-  /**
-   * 被淘汰的累计桶是否已经被更**新的投影基线**整块覆盖。
-   *
-   * 为什么必须判断：基线（session/follow 快照的 tokenUsage）本身就是"整条会话日志"的
-   * 权威累计，包含 seq <= asOfSeq 的全部事件；而淘汰桶没有 seq，旧代码无条件把它和基线
-   * 相加 —— 一旦重连后拿到的基线覆盖了被淘汰的采样，这部分 token 与花费就被算了两遍
-   * （实测 +33%，且只有 reset() 能清掉）。
-   */
-  function evictionCovered(entry) {
-    if (!entry) return false;
-    const base = baselines.get(entry.sessionId);
-    const maxSeq = Number(entry.maxSeq);
-    if (!base || !Number.isFinite(maxSeq) || maxSeq < 0) return false;
-    return Number(base.seq) >= maxSeq;
+  // 任意新基线都可能落在淘汰范围中间，未覆盖增量必须保留各自的序号和身份。
+  // maxLines 只限制逐轮明细，收到基线前不能把这些增量无损压成单个桶。
+  function pruneEvictions(sessionId) {
+    const entry = evicted.get(sessionId);
+    const base = baselines.get(sessionId);
+    if (!entry || !base) return;
+    for (const [id, item] of entry.items) {
+      if (item.seq <= base.seq) {
+        entry.items.delete(id);
+        evictedDirty = true;
+      }
+    }
+    if (entry.legacy && entry.legacy.maxSeq >= 0 && base.seq >= entry.legacy.maxSeq) {
+      entry.legacy = null;
+      evictedDirty = true;
+    }
+    if (!entry.items.size && !entry.legacy) evicted.delete(sessionId);
+  }
+
+  function evictionTotals(entry) {
+    const total = { buckets: { ...ZERO_BUCKETS }, cost: 0, byTier: { peak: 0, off: 0 }, estimated: false };
+    if (!entry) return total;
+    if (entry.legacy) {
+      total.buckets = addBuckets(total.buckets, entry.legacy.buckets);
+      total.cost += entry.legacy.cost;
+      total.byTier.peak += entry.legacy.byTier.peak;
+      total.byTier.off += entry.legacy.byTier.off;
+      total.estimated ||= entry.legacy.estimated;
+    }
+    for (const item of entry.items.values()) {
+      total.buckets = addBuckets(total.buckets, item.buckets);
+      total.cost += item.cost;
+      total.byTier[item.tier] += item.cost;
+      total.estimated ||= item.estimated;
+    }
+    return total;
+  }
+
+  function hasUnresolvedLegacyEviction(sessionIds = evicted.keys()) {
+    return [...sessionIds].some((sid) => evicted.get(sid)?.legacy && baselines.has(sid));
   }
 
   function maybeCompact() {
@@ -424,7 +425,7 @@ export function createTokenLedger({
 
     const key = keyOf(sessionId);
     const sk = sampleKeyOf(sessionId, turn, step, retry);
-    const prev = samples.get(sk);
+    const prev = samples.get(sk) ?? evicted.get(sessionId)?.items.get(sk);
     if (prev && seq >= 0 && prev.seq >= seq) return false;
 
     const record = {
@@ -434,6 +435,7 @@ export function createTokenLedger({
       provider: eventProvider ?? prev?.provider,
       b: buckets
     };
+    if (evicted.get(sessionId)?.items.delete(sk)) evictedDirty = true;
     samples.set(sk, {
       sessionId, key, seq, t, turn, step, retry,
       model: record.model, provider: record.provider, buckets
@@ -466,6 +468,7 @@ export function createTokenLedger({
       && prev.buckets.cacheWrite === buckets.cacheWrite
       && prev.buckets.output === buckets.output;
     baselines.set(sessionId, { sessionId, key, seq, t, model, provider, buckets });
+    pruneEvictions(sessionId);
     if (t > (sessionSeen.get(sessionId) ?? 0)) sessionSeen.set(sessionId, t);
     // 内容与 seq 都没变的重复基线（重连重发）不再落盘：否则每重连一次就多一行，
     // 而 follow 集合只会增长，日志会被无意义地推大。
@@ -588,8 +591,7 @@ export function createTokenLedger({
     for (const sid of sessionIds) {
       const base = baselines.get(sid);
       const entry = index.get(sid) ?? null;
-      const rawGone = evicted.get(sid) ?? null;
-      const gone = evictionCovered(rawGone) ? null : rawGone;
+      const gone = evictionTotals(evicted.get(sid));
       const liveBuckets = entry?.liveBuckets ?? { ...ZERO_BUCKETS };
       const cumulative = addBuckets(base?.buckets ?? ZERO_BUCKETS, gone?.buckets ?? ZERO_BUCKETS);
       const total = addBuckets(cumulative, liveBuckets);
@@ -687,6 +689,7 @@ export function createTokenLedger({
     return {
       ok: true,
       generatedAt: now(),
+      usageIncomplete: hasUnresolvedLegacyEviction(),
       priceVersion: priceTable.version,
       currency: priceTable.currency,
       symbol: priceTable.symbol,
@@ -730,6 +733,7 @@ export function createTokenLedger({
       generatedAt: now(),
       currency: priceTable.currency,
       symbol: priceTable.symbol,
+      usageIncomplete: hasUnresolvedLegacyEviction(sids),
       ...view,
       turnLimit,
       turns: rows.slice(0, Math.max(1, Math.min(1000, Number(turnLimit) || 200)))
@@ -790,9 +794,9 @@ export function createTokenLedger({
     // 非 live 采样绝不能计入：基线已经包含了它的历史，再算一次就是重复计费，offChartCost 会凭空变大。
     let ledgerCost = 0;
     let ledgerBuckets = { ...ZERO_BUCKETS };
-    for (const e of evicted.values()) {
-      if (evictionCovered(e)) continue; // 已被投影基线覆盖：再加一次就是重复计费
-      ledgerCost += Number(e.cost) || 0;
+    for (const entry of evicted.values()) {
+      const e = evictionTotals(entry);
+      ledgerCost += e.cost;
       ledgerBuckets = addBuckets(ledgerBuckets, e.buckets);
     }
     for (const base of baselines.values()) {
@@ -868,6 +872,7 @@ export function createTokenLedger({
       busiest: busiest ? { t: busiest.t, cost: busiest.cost, tokens: busiest.tokens } : null,
       estimated,
       countedSamples,
+      usageIncomplete: hasUnresolvedLegacyEviction(),
       // 时间轴之外的部分：图上画不出来，控制台会单独说明，避免"图上加起来 ≠ 总花费"引起误会。
       offChartCost: Math.max(0, ledgerCost - totals.cost),
       offChartTokens: Math.max(0, ledgerTokens - totals.tokens)
@@ -905,6 +910,8 @@ export function createTokenLedger({
       journalLines,
       maxLines,
       droppedLines,
+      pendingEvictedSamples: [...evicted.values()].reduce((n, e) => n + e.items.size, 0),
+      legacyEvictionSessions: [...evicted.values()].filter((e) => e.legacy).length,
       sessions: new Set([...baselines.keys(), ...sessionSeen.keys()]).size,
       baselines: baselines.size,
       samples: samples.size,
