@@ -68,6 +68,7 @@
 | CSRF | 非 GET 请求 | 必须 `content-type: application/json`；若带 `Origin`，其 host 必须等于本机 |
 | agent 令牌隔离 | 请求前缀白名单 | 带 `x-agent-token` 的请求默认拒绝，仅放行 `/api/status`、`/api/socialV2/*`、`/api/send/*`、`/api/images/*`、`/api/authorize/read`；管理端点（人格/提示词/思考强度/白名单/重启/令牌）一律 403 |
 | 空令牌拒绝 | `x-agent-token === ''` | 一律 403，避免"空 = 管理端"的绕过 |
+| closed-agent 群成员读取 | 中央鉴权与路由双重检查 | 仅 `closed-agent` 的 `GET /api/socialV2/group-members` 允许携带有效控制台凭据的无会话令牌 `x-agent-call`；目标仍必须命中群白名单且不在拒绝名单。其他模式要求当前会话令牌并校验目标 |
 | 控制台重新登录 | 页面内单一认证流程 | 并发 401 共享一次表单；未认证和验证期间暂停轮询，取消后不自动再弹；验证成功后恢复请求 |
 | 发布隐私扫描 | `scripts/privacy-scan.mjs` | 逐规则匹配并持续前进；例外限定到文件、规则和完整匹配值，不再整文件放行。文件枚举、读取、规则或预算失败返回 `complete: false` 与退出码 2；报告隐藏命中值。二进制文件不扫描，启发式规则不能识别任意秘密 |
 | 写操作不挂 GET | 全路由审查 | 会触发副作用的接口（表情强制同步、语音同步）一律 POST；GET 只读 |
