@@ -9260,7 +9260,7 @@ async function main() {
       promptText = buildWakePromptV2(key, opts.wakeReason);
       wakeSnapshot = buildWakeSnapshotV2(key);
       if (wakeSnapshot) {
-        promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
+        promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}`;
       }
     }
     let content = [{ type: 'text', text: withSlangContext(promptText) }];
@@ -10296,11 +10296,6 @@ async function main() {
     return null;
   }
 
-  /**
-   * 【时间感】规则块。没有可判断的消息时返回空串（引导/定时唤醒不必背这段）。
-   *
-   * 注意阈值必须和 §timeSenseCfg 一致，否则模型会看到自相矛盾的两档。
-   */
   function buildTimeSenseLine(st) {
     const now = Date.now();
     const newest = [...(Array.isArray(st.unread) ? st.unread : [])].reverse().find((m) => m && !m.isSelf)
@@ -10312,22 +10307,8 @@ async function main() {
     const { chatMin, silentMin } = timeSenseCfg();
     const sender = String(newest.sender || '未知');
     const ageMin = Math.max(0, Math.floor((now - Number(newest.time)) / 60000));
-    const staleNow = ageMin >= chatMin;
-    const tooOld = ageMin >= silentMin;
-    const lines = [
-      `【时间感：先看消息多旧，再决定怎么开口】现在 ${localClockText(now)}；最新一条来自「${sender}」，是 ${ageText} 之前发的（${localClockText(newest.time)}）。`,
-      '- 消息里的 at 是本地时间、ago 是距现在多久；开口前先确认最新那条的 ago，不要凭感觉当成"刚刚"。',
-      `- ${chatMin} 分钟以内：正常接，当实时对话。`
-    ];
-    // 中间档只在两档阈值真的分开时才写：silentMin === chatMin 时写「60～60 分钟」是自相矛盾的废话。
-    if (silentMin > chatMin) {
-      lines.push(`- ${chatMin}～${silentMin} 分钟：可以接，但别用"刚""哈哈哈刚看到"这类实时语气；先确认这个话题还在不在、对方还在不在。`);
-    }
-    lines.push(`- 超过 ${silentMin} 分钟：默认不回，直接 qq_mark_read 收尾；只有当那条明确是找你/提问你、而且回答现在仍然有用时才回，并且开头要带时间感（"这条我才看到""过了挺久才看到"）。`);
-    if (staleNow) {
-      lines.push(`⚠️ 本次属于「旧账」：最新消息已经是 ${ageText} 前，${tooOld ? `超过 ${silentMin} 分钟` : `超过 ${chatMin} 分钟`}。不要用秒回语气，也不要把别人的旧话题当现在的事接。`);
-    }
-    return `${lines.join('\n')}\n\n`;
+    const ageBand = ageMin >= silentMin ? '久远' : ageMin >= chatMin ? '旧消息' : '实时';
+    return `【时间感】现在 ${localClockText(now)}；最新来自「${sender}」：${ageText} 前（${localClockText(newest.time)}）；档位=${ageBand}；旧消息阈值=${chatMin} 分钟，久远阈值=${silentMin} 分钟。\n\n`;
   }
 
   function buildWakeSnapshotV2(key) {
@@ -10401,12 +10382,9 @@ async function main() {
     const name = String(selfDisplayName || '').trim();
     const id = String(selfUserId || '').trim();
     if (!name && !id) return '';
-    const label = name ? `「${name}」` : '（昵称未取到）';
+    const label = name ? `@${name}` : '（昵称未取到）';
     const idText = id ? `（QQ ${id}）` : '';
-    const callBits = name
-      ? `消息里出现「@${name}」、有人叫「${name}」、或引用你的消息，指的都是你 —— 不要当成别人`
-      : '被 @、被叫到你的昵称、或引用你的消息，指的都是你 —— 不要当成别人';
-    return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
+    return `【你的身份】${label}${idText}\n\n`;
   }
 
   function buildWakePromptV2(key, reason) {
@@ -10414,7 +10392,7 @@ async function main() {
     const roleLine = roleState.role ? `【当前角色】${roleState.role}\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    const tokenLine = `【会话令牌】${st.agentToken}\n\n`;
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
@@ -10427,8 +10405,8 @@ async function main() {
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const replyTiming = replyTimingV2(st);
-    const replyLine = `【首回复节奏】需要短静默时用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})，从最后来信计时，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒；已安静够久可直接回。\n\n`;
-    const preSleepLine = `【收尾观察】本会话观察窗口 timeoutMs=${preSleepMs}；结束语豁免与新消息处理遵循预设。以等待返回的 canSleepNow/hint 为准：true 可收尾，false 按 hint 的 timeoutMs 继续等待。首答前的短静默不能替代收尾观察。\n\n`;
+    const replyLine = `【首回复节奏】quietMs=${replyTiming.quietMs}，剩余 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒\n\n`;
+    const preSleepLine = `【收尾观察】timeoutMs=${preSleepMs}\n\n`;
     const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
     const lastAiMin = st.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(st.lastAiReplyAt)) / 60000)) : null;
     const statusBits = [`未读 ${(st.unread || []).length} 条`];
@@ -10465,23 +10443,23 @@ async function main() {
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
     const triggeredAgo = triggeredMsg ? describeAge(triggeredMsg.time, Date.now()) : '';
-    const triggeredLine = triggeredAgo ? `（触发这条是 ${triggeredAgo} 前发的${triggeredMsg?.sender ? `，来自「${triggeredMsg.sender}」` : ''}，不是刚刚）` : '';
+    const triggeredLine = triggeredAgo ? `；触发消息=${triggeredAgo} 前${triggeredMsg?.sender ? `，来自「${triggeredMsg.sender}」` : ''}` : '';
     if (reason === 'bootstrap') {
-      return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n首次请调用 qq_get_prompt 获取角色和配置，先处理待回应的消息，再按预设完成观察与收尾。`;
+      return `${base}【引导唤醒】${key}\n首次调用 qq_get_prompt 获取角色和配置。`;
     }
     if (reason === 'timeout') {
-      return `${base}【唤醒】${key}\n原因：你设置的有限潜水时间已到；在你规定的时间内没有任何一项条件被触发，只是因为时间到了所以你被唤醒。\n你可以查看消息，或继续设置新的唤醒条件。`;
+      return `${base}【唤醒】${key}\n原因：timeout，有限潜水到期，未触发其他条件。`;
     }
     if (reason === 'replyCheck') {
-      return `${base}【回复检查】${key}\n你刚刚发送过消息，回来检查是否有人回复。先看消息，没人回复时无需硬补，按预设完成观察与收尾。`;
+      return `${base}【回复检查】${key}`;
     }
     if (reason === 'proactiveCheck') {
-      return `${base}【主动机会】${key}\n群里安静了一段时间，可以按兴趣和记忆主动开话题、续聊或分享；没有自然话题就完成观察与收尾。`;
+      return `${base}【主动机会】${key}`;
     }
     if (reason === 'poke') {
-      return `${base}【唤醒】${key}\n有人拍了一拍，可能拍你或别人。先看消息中的 [拍一拍] 事件，按对象和语境决定回话、回拍或不接。`;
+      return `${base}【唤醒】${key}\n原因：poke`;
     }
-    return `${base}【唤醒】${key}\n原因：${reason}${triggeredLine}\n先看已有消息，有快照时先用快照；按话题、对象和消息时间决定参与，需要更多信息再查工具，准备收尾时完成观察。`;
+    return `${base}【唤醒】${key}\n原因：${reason}${triggeredLine}`;
   }
 
   function buildWakeReminderPromptV2(key) {
@@ -10489,9 +10467,9 @@ async function main() {
     const roleLine = roleState.role ? `【当前角色】${roleState.role}\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    const tokenLine = `【会话令牌】${st.agentToken}\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${identityLine}${tokenLine}【提醒】${key} 尚未完成回合收尾。按预设完成观察，本会话窗口 timeoutMs=${preSleepMs}，以 canSleepNow/hint 为准。配置不变用 qq_mark_read，需要改动用 qq_set_wake_config；throughSeq 只传已查看的 readThroughSeq。`;
+    return `${roleLine}${identityLine}${tokenLine}【提醒】${key} 尚未完成回合收尾；timeoutMs=${preSleepMs}。`;
   }
 
   async function sendWakePromptV2(key, reason) {

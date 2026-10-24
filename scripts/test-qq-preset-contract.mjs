@@ -116,6 +116,15 @@ test('autonomy limits and the observation escape hatch stay described', () => {
   ]) assert.ok(prefix.includes(text), `missing rule: ${text}`);
 });
 
+test('preset owns identity, wake reasons, time policy and close-result instructions', () => {
+  for (const rule of ['@/引用指向该 QQ 号就是在叫你', '没有快照时先用 qq_get_unread_messages',
+    'canSleepNow/hint', 'true 可收尾，false 按 hint 的 timeoutMs 继续等待',
+    '旧消息先确认话题与对方是否仍在', '久远默认不回', '回答现在仍有用时才回',
+    'timeout 仅表示有限潜水到期，不代表有新消息', 'poke 可能拍你或别人']) {
+    assert.ok(prefix.includes(rule), `missing preset rule: ${rule}`);
+  }
+});
+
 test('wake text retains session-specific timing, identity, memory and unread without changing state', async () => {
   const now = Date.UTC(2026, 9, 23, 12);
   class FixtureDate extends Date {
@@ -143,17 +152,17 @@ test('wake text retains session-specific timing, identity, memory and unread wit
     for (const reason of ['bootstrap', 'atMention@seq1', 'timeout', 'replyCheck', 'proactiveCheck', 'poke']) {
       const wake = h.buildWakePromptV2('group:456', reason);
       for (const text of ['group:456', st.agentToken, '测试角色', '@测试昵称', '10000',
-        'quietMs=17000', '还差约 12 秒', 'timeoutMs=190000', 'canSleepNow/hint',
+        'quietMs=17000', '剩余 12 秒', 'timeoutMs=190000',
         '未读 1 条', '指定成员(1:10001)', '测试中的话题', '【参与度参考】']) {
         assert.ok(wake.includes(text), `${reason} lost ${text}`);
       }
       if (reason === 'bootstrap') assert.match(wake, /qq_get_prompt/);
       else assert.doesNotMatch(wake, /完整角色卡请调用 qq_get_prompt/);
-      assert.doesNotMatch(wake, /【反AI味】|【积极性】|【表情包策略/);
+      assert.doesNotMatch(wake, /【反AI味】|【积极性】|【表情包策略|canSleepNow|通过.*水位|以上消息已提供/);
     }
     const reminder = h.buildWakeReminderPromptV2('group:456');
     for (const text of ['group:456', st.agentToken, '测试角色', '@测试昵称', 'timeoutMs=190000',
-      'canSleepNow/hint', 'qq_mark_read', 'qq_set_wake_config', 'throughSeq', 'readThroughSeq']) {
+      '尚未完成回合收尾']) {
       assert.ok(reminder.includes(text), `reminder lost ${text}`);
     }
     assert.equal(JSON.stringify({ unread: st.unread, wakeConfig: st.wakeConfig, activeTopics: st.activeTopics, readThroughSeq: st.lastReadThroughSeq }), before);

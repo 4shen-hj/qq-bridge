@@ -480,6 +480,35 @@ await test('offline reserved2 wake replay cannot leak into an ordinary chat sess
   assert.equal(h.calls.prompts.length, 0);
 });
 
+await test('compact delivered wake preserves a partial snapshot and its receipt within the fixture budget', async ({ h, st, request, append }) => {
+  h.setSelfIdentity('测试昵称', '10000');
+  h.cfg.socialV2.context.wakeMessageLimit = 1;
+  h.cfg.socialV2.context.wakeRecentLimit = 0;
+  append('first visible message');
+  append('second unseen message');
+  await h.sendWakePromptV2(KEY, 'question');
+  assert.equal(h.calls.prompts.length, 1);
+  const text = h.calls.prompts[0].content.filter((part) => part.type === 'text').map((part) => part.text).join('\n');
+  const snapshotStart = text.indexOf('【本次消息快照】\n');
+  assert.ok(snapshotStart >= 0);
+  const snapshot = JSON.parse(text.slice(snapshotStart + '【本次消息快照】\n'.length));
+  assert.equal(snapshot.partial, true);
+  assert.equal(snapshot.readThroughSeq, 1);
+  assert.deepEqual(snapshot.messages.map((message) => message.seq), [1]);
+  assert.equal(snapshot.unreadCount, 2);
+  assert.ok(text.includes(st.agentToken));
+  assert.ok(text.includes('@测试昵称（QQ 10000）'));
+  assert.ok(text.includes('timeoutMs=1000'));
+  assert.ok(text.length <= 1000, `compact delivered fixture: ${text.length} characters`);
+  assert.ok(snapshotStart <= 600, `wake envelope fixture: ${snapshotStart} characters`);
+  assert.deepEqual(seqs(st.unread), [1, 2]);
+  assert.equal((await request('wake-config', { body: { config: ACTIVE, throughSeq: 2 } })).status, 400);
+  assert.equal((await request('wake-config', { body: { config: ACTIVE, throughSeq: 1 } })).status, 200);
+  assert.deepEqual(seqs(st.unread), [2]);
+  assert.equal(h.calls.sent.length, 0);
+  console.log(`compact wake fixture: envelope=${snapshotStart}, delivered=${text.length} characters (not tokens)`);
+});
+
 await test('real wake delivery inlines compact messages with exact quote and media handles', async ({ h, st, request, append }) => {
   append('fixture-inline-content', { id: '900719925474099312345',
     media: [{ kind: 'image', file: 'fixture-local-image', url: 'https://images.invalid/fixture-secret' }],

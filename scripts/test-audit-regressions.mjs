@@ -156,7 +156,7 @@ await test('R4 timeout/replyCheck 类暂存唤醒按定时器语义补发', asyn
     for (let i = 0; i < 40 && !h.calls.prompts.length; i += 1) await sleep(25);
     assert.equal(h.calls.prompts.length, 1, '到期的有限潜水必须补发一次 timeout 唤醒');
     const text = h.calls.prompts[0].content.map((c) => String(c?.text ?? '')).join('\n');
-    assert.match(text, /有限潜水时间已到|睡眠时间已到/);
+    assert.match(text, /原因：timeout，有限潜水到期/);
 
     assert.equal(h.replayPendingWakeReasonsV2('group:456'), null, '新唤醒仍繁忙时保留后续项');
     h.pendingWakeKeys.delete('group:456');
