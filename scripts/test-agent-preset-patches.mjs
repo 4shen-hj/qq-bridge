@@ -12,7 +12,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import yaml from 'js-yaml';
 import {
-  BUNDLE_DIR, GUARD_SPECIFIER, PRESETS, REPO_ROOT,
+  BUNDLE_DIR, GUARD_SPECIFIER, SESSION_TOOLS_SPECIFIER, PRESETS, REPO_ROOT,
   buildPatches, patchFileFor, presetRowId,
 } from './build-agent-preset-patches.mjs';
 
@@ -51,7 +51,10 @@ for (const name of PRESETS) {
   // 与源行列表逐字对比：只允许守卫行的 name 被改写。
   const source = load(path.join(REPO_ROOT, 'dsh', 'agent-presets', name, 'agent.cordis.yml'));
   const expected = structuredClone(source);
-  for (const r of expected) if (r.name === './qq-tool-restrict.mjs') r.name = GUARD_SPECIFIER;
+  for (const r of expected) {
+    if (r.name === './qq-tool-restrict.mjs') r.name = GUARD_SPECIFIER;
+    if (r.name === './qq-session-tools.mjs') r.name = SESSION_TOOLS_SPECIFIER;
+  }
   assert.deepEqual(row.config.plugins, expected, `${name}: config.plugins 必须与 agent.cordis.yml 完全一致（守卫名除外）`);
   ok(true, `${name}: config.plugins 与 agent.cordis.yml 逐字一致（${expected.length} 行）`);
 

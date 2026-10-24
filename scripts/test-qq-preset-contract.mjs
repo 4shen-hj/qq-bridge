@@ -25,10 +25,11 @@ test('reserved2 YAML resolves to the expected persona and template variables', (
 
 test('local/admin tool restrictions and existing compaction budgets stay intact', () => {
   assert.deepEqual(preset.map((row) => row.id), [
-    'persona', 'tool-web', 'tool-ask-user', 'tool-todo', 'qq-tool-restrict', 'compaction',
+    'persona', 'tool-web', 'tool-ask-user', 'tool-todo', 'qq-tool-restrict', 'qq-session-tools', 'compaction',
   ]);
   assert.deepEqual(preset.find((row) => row.id === 'tool-web').config, { search: false, fetch: false });
   assert.equal(preset.find((row) => row.id === 'qq-tool-restrict').name, './qq-tool-restrict.mjs');
+  assert.equal(preset.find((row) => row.id === 'qq-session-tools').name, './qq-session-tools.mjs');
   const compaction = preset.find((row) => row.id === 'compaction');
   assert.deepEqual(compaction.isolate, { compaction: true, toolResultPruner: true });
   assert.deepEqual(compaction.config.find((row) => row.id === 'tool-result-pruner').config, {
@@ -109,8 +110,7 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     'qq_slang_query', 'qq_slang_submit', '不重复提交',
     // 频率上限
     '普通闲聊约 3~5 轮一张', '别刷屏', '每条只能一张，不能附带文字', '不要频繁拍',
-    // 会话令牌是硬前置，漏传会被拒绝。
-    '作为 token 参数传入',
+    '无需填写 key、token、groupId 或 userId',
     // 指定成员唤醒
     'triggers.speakerIds', '不凭记忆乱填',
   ]) assert.ok(prefix.includes(text), `missing rule: ${text}`);
@@ -151,20 +151,22 @@ test('wake text retains session-specific timing, identity, memory and unread wit
     const before = JSON.stringify({ unread: st.unread, wakeConfig: st.wakeConfig, activeTopics: st.activeTopics, readThroughSeq: st.lastReadThroughSeq });
     for (const reason of ['bootstrap', 'atMention@seq1', 'timeout', 'replyCheck', 'proactiveCheck', 'poke']) {
       const wake = h.buildWakePromptV2('group:456', reason, h.buildWakeSnapshotV2('group:456'));
-      for (const text of ['group:456', st.agentToken, '测试角色', '@测试昵称', '10000',
+      for (const text of ['group:456', '测试角色', '@测试昵称', '10000',
         'quietMs=17000', '剩余 12 秒', 'timeoutMs=190000',
         '未读 1 条', '指定成员(1:10001)', '【参与度参考】']) {
         assert.ok(wake.includes(text), `${reason} lost ${text}`);
       }
+      assert.ok(!wake.includes(st.agentToken), `${reason} exposed session token`);
       if (reason === 'bootstrap') assert.match(wake, /qq_get_prompt/);
       else assert.doesNotMatch(wake, /完整角色卡请调用 qq_get_prompt/);
       assert.doesNotMatch(wake, /【反AI味】|【积极性】|【表情包策略|canSleepNow|通过.*水位|以上消息已提供/);
     }
     const reminder = h.buildWakeReminderPromptV2('group:456');
-    for (const text of ['group:456', st.agentToken, '测试角色', '@测试昵称', 'timeoutMs=190000',
+    for (const text of ['group:456', '测试角色', '@测试昵称', 'timeoutMs=190000',
       '尚未完成回合收尾']) {
       assert.ok(reminder.includes(text), `reminder lost ${text}`);
     }
+    assert.ok(!reminder.includes(st.agentToken), 'reminder exposed session token');
     assert.equal(JSON.stringify({ unread: st.unread, wakeConfig: st.wakeConfig, activeTopics: st.activeTopics, readThroughSeq: st.lastReadThroughSeq }), before);
     assert.equal(h.calls.sent.length, 0);
     assert.equal(h.calls.prompts.length, 0);

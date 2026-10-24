@@ -40,6 +40,7 @@
 | --- | --- | --- |
 | 预设工具守卫 | `plugins/qq-agent-presets/qq-tool-restrict.mjs`（唯一权威实现，`dsh/agent-presets/*/qq-tool-restrict.mjs` 只是 re-export 壳） | 两道闸门：① 注册期 `tools.restrict({deny})` 把本地执行/宿主运行期工具**从模型 schema 里隐藏**（67 个名字，2026-09-29 按 DSH 0.2.0-rc.2 真实工具清单重新对账）；② 执行期 `tools.guard` 精确白名单：仅 `mcp__snowluma__*` / `mcp__snowluma-host__*` / `mcp__web-search-safe__*` + `ask_user_question` / `todo_write`；空/未知名字一律拒绝；内置 `tool-web` 的 search/fetch 关闭。对账工具：`npm run scan:tool-names`（**每次升级 DSH 后应跑一次**：`tools.restrict` 对不存在的名字会抛错并被逐个 try/catch 吞掉 ⇒ 假名 = 静默失效；新版本新增的能力若不补进名单 = 漏隐藏） |
 | 预设 fail-closed | `resolvePresetName()` + `ensureSession()` | 群聊/仿真会话拿不到受限预设时**拒绝建会话**，绝不回退到含本地工具的 DSH 默认预设；只有 `closed-agent`（管理员私聊）允许回退 |
+| 二代会话工具认证 | `qq-session-tools.mjs` + `GET /api/internal/session-tool-auth` | `qq-chat-v2` 用同名 scoped 工具隐藏 `key`、`token` 和会话目标参数。工具执行时从 DSH `exec.agent.session.id` 查询当前映射，宿主用控制台凭据取得现有会话令牌，再传给原 MCP 工具；模型参数和全局工具定义不含该凭据。映射、模式、白名单、暂停或令牌失效时拒绝调用，不自动重试发送。读水位 `throughSeq` 仍由模型提交。 |
 | 发送强制白名单 | 所有 `/api/send/*`、`/api/socialV2/send-*` | 目标必须命中 `allow.groups` / `allow.private`（每次都重新校验，不做缓存） |
 | 动态 ACL | `resolveVoicePathForV2()` / `voicePathInsideLibrary()` | 语音只能取语音库目录内的文件；贴纸只能发收藏库内的表情；图片只能读 SnowLuma home 内的本地文件（realpath 复核防符号链接逃逸） |
 | **只探测、不部署**（L6 设计不变量） | `mcp-host-server.js` | 该 MCP server **只提供 `snowluma_status`（只读探活 `get_login_info`）**。⚠️ **v0.1.5 起删除了 `start_snowluma` / `stop_snowluma` 与 `snowluma.allowProcessControl`**：SnowLuma EULA §5.4 规定「将其并入第三方安装包或 Docker 镜像、**通过自动化脚本部署**」须事先书面授权，原生组件属**专有组件**。⇒ 本程序不安装、不复制、不打包、不程序化启停 SnowLuma；用户自行安装与启动。详见 `LICENSE` 与 `QSH-plan/QSH_PLAN.md` §6.0 |
@@ -71,6 +72,7 @@
 | agent 令牌隔离 | 请求前缀白名单 | 带 `x-agent-token` 的请求默认拒绝，仅放行 `/api/status`、`/api/socialV2/*`、`/api/send/*`、`/api/images/*`、`/api/authorize/read`；管理端点（人格/提示词/思考强度/白名单/重启/令牌）一律 403 |
 | 空令牌拒绝 | `x-agent-token === ''` | 一律 403，避免"空 = 管理端"的绕过 |
 | closed-agent 群成员读取 | 中央鉴权与路由双重检查 | 仅 `closed-agent` 的 `GET /api/socialV2/group-members` 允许携带有效控制台凭据的无会话令牌 `x-agent-call`；目标仍必须命中群白名单且不在拒绝名单。其他模式要求当前会话令牌并校验目标 |
+| 内部会话解析 | `GET /api/internal/session-tool-auth` | 仅本机控制台凭据可调用；显式拒绝 `x-agent-call` 和 `x-agent-token`。要求唯一的正反会话映射、当前权限策略、`reserved2` 模式、二代开关与未暂停状态，并且会话已有令牌。重置工作区时先撤销映射与令牌，再等待 DSH 归档。 |
 | 控制台重新登录 | 页面内单一认证流程 | 并发 401 共享一次表单；未认证和验证期间暂停轮询，取消后不自动再弹；验证成功后恢复请求 |
 | 发布隐私扫描 | `scripts/privacy-scan.mjs` | 逐规则匹配并持续前进；例外限定到文件、规则和完整匹配值，不再整文件放行。文件枚举、读取、规则或预算失败返回 `complete: false` 与退出码 2；报告隐藏命中值。二进制文件不扫描，启发式规则不能识别任意秘密 |
 | 写操作不挂 GET | 全路由审查 | 会触发副作用的接口（表情强制同步、语音同步）一律 POST；GET 只读 |

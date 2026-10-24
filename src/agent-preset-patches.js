@@ -41,10 +41,12 @@ export function presetRowId(name) {
  * node_modules junction 由 setup-dsh.mjs 或 dev_heal_links 维护。
  */
 export const GUARD_SPECIFIER = 'qq-agent-presets/qq-tool-restrict.mjs';
+export const SESSION_TOOLS_SPECIFIER = 'qq-agent-presets/qq-session-tools.mjs';
 
 /** 源里允许出现的相对行名 → 新机制下的等价引用。其它相对名一律报错（避免静默装不上）。 */
 const RELATIVE_ROW_REWRITES = new Map([
   ['./qq-tool-restrict.mjs', GUARD_SPECIFIER],
+  ['./qq-session-tools.mjs', SESSION_TOOLS_SPECIFIER],
 ]);
 
 export const BUNDLE_DIR = path.join(REPO_ROOT, 'plugins', 'qq-agent-presets');
@@ -105,6 +107,9 @@ function normalizeRows(rows, preset) {
   const normalized = walk(rows, 'plugins');
   for (const required of ['persona', 'qq-tool-restrict']) {
     if (!seen.has(required)) throw new Error(`${preset}: 行列表缺少 ${required} 行（安全/人格边界不允许缺失）`);
+  }
+  if (preset === 'qq-chat-v2' && !seen.has('qq-session-tools')) {
+    throw new Error(`${preset}: 行列表缺少 qq-session-tools 行（会话认证边界不允许缺失）`);
   }
   return normalized;
 }

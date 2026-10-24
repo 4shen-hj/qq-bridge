@@ -449,7 +449,7 @@ await test('a retired prompt session cannot grant a receipt when its old accepta
   assert.deepEqual(seqs(st.unread), [1]);
 });
 
-await test('offline wake replay builds a fresh snapshot with the current session token', async ({ h, st, request, append }) => {
+await test('offline wake replay builds a fresh snapshot without exposing session tokens', async ({ h, st, request, append }) => {
   await h.ensureSession(KEY);
   const originalToken = st.agentToken;
   append('queued initial message');
@@ -465,7 +465,7 @@ await test('offline wake replay builds a fresh snapshot with the current session
   const content = h.calls.prompts[0].content.map((part) => part.text || '').join('\n');
   assert.ok(content.includes('queued initial message'));
   assert.ok(content.includes('queued later message'));
-  assert.ok(content.includes(st.agentToken));
+  assert.ok(!content.includes(st.agentToken));
   assert.ok(!content.includes(originalToken));
   assert.equal((await request('mark-read', { body: { throughSeq: 2 }, token: st.agentToken })).status, 200);
 });
@@ -496,7 +496,7 @@ await test('compact delivered wake preserves a partial snapshot and its receipt 
   assert.equal(snapshot.readThroughSeq, 1);
   assert.deepEqual(snapshot.messages.map((message) => message.seq), [1]);
   assert.equal(snapshot.unreadCount, 2);
-  assert.ok(text.includes(st.agentToken));
+  assert.ok(!text.includes(st.agentToken));
   assert.ok(text.includes('@测试昵称（QQ 10000）'));
   assert.ok(text.includes('timeoutMs=1000'));
   assert.ok(text.length <= 1000, `compact delivered fixture: ${text.length} characters`);

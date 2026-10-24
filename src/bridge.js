@@ -3428,6 +3428,28 @@ async function main() {
           sendJson({ ok: false, error: 'agent token 不能为空' }, 403);
           return;
         }
+        if (req.method === 'GET' && url.pathname === '/api/internal/session-tool-auth') {
+          if (req.headers['x-agent-call'] !== undefined || req.headers['x-agent-token'] !== undefined) {
+            sendJson({ ok: false, error: '该接口仅宿主可用' }, 403);
+            return;
+          }
+          const sessionId = url.searchParams.get('sessionId');
+          const matches = sessionId ? Object.entries(state.sessions).filter(([, id]) => id === sessionId) : [];
+          if (currentMode !== 'reserved2' || cfg.socialV2?.enabled === false || socialV2.paused
+            || matches.length !== 1 || reverse.get(sessionId) !== matches[0][0]
+            || !isCurrentSession(matches[0][0], sessionId)) {
+            sendJson({ ok: false, error: 'QQ 会话不可用' }, 403);
+            return;
+          }
+          const [key] = matches[0];
+          const st = socialV2.conversations.get(key);
+          if (!st?.agentToken) {
+            sendJson({ ok: false, error: 'QQ 会话不可用' }, 403);
+            return;
+          }
+          sendJson({ ok: true, key, token: st.agentToken });
+          return;
+        }
         // 暂停二代 AI 时，所有带 agent token 的 v2 工具调用一律拒绝
         if (socialV2.paused && req.headers['x-agent-token'] && (url.pathname.startsWith('/api/socialV2/') || url.pathname.startsWith('/api/send/') || url.pathname.startsWith('/api/images/'))) {
           sendJson({ ok: false, error: 'AI 已暂停，当前不允许执行 v2 工具' }, 403);
@@ -4430,13 +4452,8 @@ async function main() {
           const isV2 = currentMode === 'reserved2';
           const roleState = readRoleState();
           const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
-          // 二代必须带会话令牌，否则 AI 调用任何 MCP 状态/发送工具都会被拒。
-          let tokenLine = '';
-          if (isV2) {
-            const stV2 = getSocialV2State(key);
-            tokenLine = `【会话令牌】${stV2.agentToken}（调用二代状态/发送工具时请在参数中带上此令牌）\n\n`;
-          }
-          const promptText = `${roleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
+          if (isV2) getSocialV2State(key);
+          const promptText = `${roleLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
           let sessionId = null;
           let popSilent = null;
           try {
@@ -7186,70 +7203,87 @@ async function main() {
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/workspace/reset') {
-          sessionEpoch++;
-          let archivedCount = 0;
-          let stoppedCount = 0;
-          try {
-            // 新版 DSH 不再提供 workspace.list；改为扫描本桥接创建的会话目录并归档。
-            // 只处理 cwd 位于 qq-bridge state/ 下的根会话；子代理会话由父会话管理，不能误归档。
-            const list = unwrap(await withTimeout(api.sessions.list({}), DSH_CONTROL_TIMEOUT_MS, 'sessions.list'), 'session.list');
-            const stateDir = path.resolve(STATE_DIR);
-            const statePrefix = path.normalize(stateDir + path.sep);
-            const normPath = (p) => path.normalize(String(p ?? '').replace(/\//g, path.sep));
-            const isUnderState = (cwd) => process.platform === 'win32'
-              ? cwd.toLowerCase().startsWith(statePrefix.toLowerCase())
-              : cwd.startsWith(statePrefix);
-            for (const item of list.items ?? []) {
-              if (item.origin === 'subagent' || item.parentSessionId) continue;
-              const cwd = normPath(item.cwd);
-              if (isUnderState(cwd)) {
-                // 归档只隐藏会话；必须先把 DSH 侧排队的工作清掉并取消当前回合。
-                try { await withTimeout(api.stopSessionWork(item.sessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); stoppedCount += 1; }
-                catch (error) { log(`⚠️ 停止旧会话失败 ${item.sessionId}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
-                try { await withTimeout(api.workspace.archiveSession({ sessionId: item.sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); archivedCount += 1; } catch {}
-              }
-            }
-          } catch {}
-          for (const entry of pending.values()) {
-            clearTimeout(entry.timer);
-            cancelPendingEntry(entry).catch(() => {});
+          if (workspaceResetting) {
+            sendJson({ ok: false, error: '工作区正在重置' }, 409);
+            return;
           }
-          pending.clear();
-          queued.clear();
-          queuedHintAt.clear();
-          sessionPromises.clear();
-          drainAllPromptQueues('工作区已清空');
-          social.states.clear();
-          social.recentMessages.clear();
-          messageMediaStore.clear();
-          seenForwardIds.clear();
-          social.pendingSummaries.clear();
-          social.silentContext.clear();
-          social.silentTurns.clear();
-          social.exitingSessions.clear();
-          slangWindows.clear();
-          slangExtractionCooldowns.clear();
-          slangSubmitTimes.clear();
-          cancelAllSocialTimers();
-          clearAllSocialV2Timers();
-          // 清空工作区 = 所有会话连同 token 一起作废，两张表整体清掉（比逐会话摘除更不容易漏）。
-          socialV2.conversations.clear();
-          CONVERSATION_TOKENS.clear();
-          KNOWN_AGENT_TOKENS.clear();
-          saveSocialV2State();
-          state.sessions = {};
-          state.sessionPolicies = {};
-          reverse.clear();
-          collectors.clear();
-          sendToolSucceededSessions.clear();
-          pendingSendToolCalls.clear();
-          v2TurnStartAt.clear();
-          toolCallNames.clear();
-          saveState();
-          try { fs.writeFileSync(ACTIVITY_LOG, ''); } catch {}
-          log(`控制台：已清空 QQ 聊天工作区（停止 ${stoppedCount} 个、归档 ${archivedCount} 个会话，映射与活动日志已清空）`);
-          sendJson({ ok: true, archivedCount, stoppedCount });
-          return;
+          sessionEpoch++;
+          workspaceResetting = true;
+          try {
+            socialV2.conversations.clear();
+            CONVERSATION_TOKENS.clear();
+            KNOWN_AGENT_TOKENS.clear();
+            state.sessions = {};
+            state.sessionPolicies = {};
+            reverse.clear();
+            saveSocialV2State();
+            saveState();
+            let archivedCount = 0;
+            let stoppedCount = 0;
+            try {
+              // 新版 DSH 不再提供 workspace.list；改为扫描本桥接创建的会话目录并归档。
+              // 只处理 cwd 位于 qq-bridge state/ 下的根会话；子代理会话由父会话管理，不能误归档。
+              const list = unwrap(await withTimeout(api.sessions.list({}), DSH_CONTROL_TIMEOUT_MS, 'sessions.list'), 'session.list');
+              const stateDir = path.resolve(STATE_DIR);
+              const statePrefix = path.normalize(stateDir + path.sep);
+              const normPath = (p) => path.normalize(String(p ?? '').replace(/\//g, path.sep));
+              const isUnderState = (cwd) => process.platform === 'win32'
+                ? cwd.toLowerCase().startsWith(statePrefix.toLowerCase())
+                : cwd.startsWith(statePrefix);
+              for (const item of list.items ?? []) {
+                if (item.origin === 'subagent' || item.parentSessionId) continue;
+                const cwd = normPath(item.cwd);
+                if (isUnderState(cwd)) {
+                  // 归档只隐藏会话；必须先把 DSH 侧排队的工作清掉并取消当前回合。
+                  try { await withTimeout(api.stopSessionWork(item.sessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork'); stoppedCount += 1; }
+                  catch (error) { log(`⚠️ 停止旧会话失败 ${item.sessionId}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
+                  try { await withTimeout(api.workspace.archiveSession({ sessionId: item.sessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); archivedCount += 1; } catch {}
+                }
+              }
+            } catch {}
+            for (const entry of pending.values()) {
+              clearTimeout(entry.timer);
+              cancelPendingEntry(entry).catch(() => {});
+            }
+            pending.clear();
+            queued.clear();
+            queuedHintAt.clear();
+            sessionPromises.clear();
+            drainAllPromptQueues('工作区已清空');
+            social.states.clear();
+            social.recentMessages.clear();
+            messageMediaStore.clear();
+            seenForwardIds.clear();
+            social.pendingSummaries.clear();
+            social.silentContext.clear();
+            social.silentTurns.clear();
+            social.exitingSessions.clear();
+            slangWindows.clear();
+            slangExtractionCooldowns.clear();
+            slangSubmitTimes.clear();
+            cancelAllSocialTimers();
+            clearAllSocialV2Timers();
+            // 清空工作区 = 所有会话连同 token 一起作废，两张表整体清掉（比逐会话摘除更不容易漏）。
+            socialV2.conversations.clear();
+            CONVERSATION_TOKENS.clear();
+            KNOWN_AGENT_TOKENS.clear();
+            saveSocialV2State();
+            state.sessions = {};
+            state.sessionPolicies = {};
+            reverse.clear();
+            collectors.clear();
+            sendToolSucceededSessions.clear();
+            pendingSendToolCalls.clear();
+            v2TurnStartAt.clear();
+            toolCallNames.clear();
+            saveState();
+            try { fs.writeFileSync(ACTIVITY_LOG, ''); } catch {}
+            log(`控制台：已清空 QQ 聊天工作区（停止 ${stoppedCount} 个、归档 ${archivedCount} 个会话，映射与活动日志已清空）`);
+            sendJson({ ok: true, archivedCount, stoppedCount });
+            return;
+          } finally {
+            workspaceResetting = false;
+          }
         }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
         if (req.method === 'POST' && url.pathname === '/api/restart') {
@@ -7288,6 +7322,7 @@ async function main() {
 
   // 会话代际：reset/清空工作区时递增，防止在途 ensureSession 把旧会话"复活"
   let sessionEpoch = 0;
+  let workspaceResetting = false;
 
   // 待应答的提问/审批：convKey -> pending
   const pending = new Map(); // key -> { kind, rpcId, sessionId, ... }
@@ -8190,6 +8225,7 @@ async function main() {
   }
 
   async function ensureSession(key) {
+    if (workspaceResetting) throw new Error('工作区正在重置');
     const epoch = sessionEpoch;
     const policy = sessionPolicy(key);
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
@@ -10396,7 +10432,6 @@ async function main() {
     const roleLine = roleState.role ? `【当前角色】${roleState.role}\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}\n\n`;
     const memoryText = formatMemoryV2(selectWakeMemory(st, wakeVisibleMessages(snapshot), reason));
     const memoryLine = memoryText ? `【相关记忆资料】${JSON.stringify(memoryText)}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
@@ -10436,13 +10471,11 @@ async function main() {
     if (Number(wcTr.probability) > 0) wcTriggers.push(`概率${wcTr.probability}`);
     const wakeLine = `【当前唤醒】${wcMode}，${wcTime}${wcTriggers.length ? `；触发：${wcTriggers.join('/')}` : ''}\n\n`;
     // 操作者预写的「初始提示词」（圈子主题/群内氛围等）：**只在首次唤醒**注入。
-    // 放在最前面几段（角色/令牌之后）而不是末尾，是为了让它在长 prompt 里足够显眼；
-    // 后续唤醒不再带它 —— 那时它已经在这条 DSH 会话的上下文里了。
     const initialPromptText = reason === 'bootstrap' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = roleLine + identityLine + initialPromptLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -10470,10 +10503,8 @@ async function main() {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}\n\n` : '';
     const identityLine = selfIdentityTextV2();
-    const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${identityLine}${tokenLine}【提醒】${key} 尚未完成回合收尾；timeoutMs=${preSleepMs}。`;
+    return `${roleLine}${identityLine}【提醒】${key} 尚未完成回合收尾；timeoutMs=${preSleepMs}。`;
   }
 
   async function sendWakePromptV2(key, reason) {

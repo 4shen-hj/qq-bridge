@@ -15,6 +15,7 @@ const tests = [
   'test-prompt-delivery-recovery.mjs',
   'test-wake-delivery-retry.mjs', 'test-voice-authorization-race.mjs',
   'test-preset-publication.mjs', 'test-agent-preset-patches.mjs',
+  'test-session-tool-auth.mjs', 'test-session-tool-resolver.mjs', 'test-session-tool-client.mjs',
   'test-restart-safety.mjs', 'test-console-safety.mjs',
   'test-audit-bridge.mjs', 'test-audit-protocol.mjs', 'test-audit-protocol-helpers.mjs',
   'test-audit-security.mjs', 'test-audit-security-mcp.mjs',
