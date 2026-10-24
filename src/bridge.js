@@ -1703,14 +1703,13 @@ async function main() {
   /**
    * 语音发送限流：与文本发送分开计数，避免语音吃掉聊天额度（也避免聊天把语音额度耗光）。
    *
-   * 只**检查**不占额度：额度在真正发出去之后才由 voiceBudgetCommit 记账 ——
-   * 这样参数错、被审计拦截、网关失败都不会白白吃掉配额（否则连失败几次就被假 429 卡住）。
+   * 在途预占也计入额度，失败释放，成功后转成发送时间。
    */
   function voiceBudgetCheck(scopeKey, cfgV) {
     const now = Date.now();
     const bucket = voiceSendTimes.get(scopeKey) ?? [];
-    const inMinute = bucket.filter((t) => now - t < 60000);
-    const inHour = bucket.filter((t) => now - t < 3600000);
+    const inMinute = bucket.filter((t) => typeof t === 'object' || now - t < 60000);
+    const inHour = bucket.filter((t) => typeof t === 'object' || now - t < 3600000);
     if (cfgV.maxPerMinute > 0 && inMinute.length + 1 > cfgV.maxPerMinute) {
       throw new Error(`语音发送频率超限（每分钟最多 ${cfgV.maxPerMinute} 条），请稍后再试`);
     }
@@ -1719,11 +1718,19 @@ async function main() {
     }
   }
 
-  /** 语音真正发出后记账（顺带裁掉超过 1 小时的旧时间戳，避免数组无界增长）。 */
-  function voiceBudgetCommit(scopeKey, at = Date.now()) {
-    const bucket = (voiceSendTimes.get(scopeKey) ?? []).filter((t) => at - t < 3600000);
-    bucket.push(at);
+  function reserveVoiceBudget(scopeKey, cfgV) {
+    voiceBudgetCheck(scopeKey, cfgV);
+    const reservation = {};
+    const bucket = (voiceSendTimes.get(scopeKey) ?? []).filter((t) => typeof t === 'object' || Date.now() - t < 3600000);
+    bucket.push(reservation);
     voiceSendTimes.set(scopeKey, bucket);
+    return (sent) => {
+      const current = voiceSendTimes.get(scopeKey) ?? [];
+      const index = current.indexOf(reservation);
+      if (index < 0) return;
+      if (sent) current[index] = Date.now();
+      else current.splice(index, 1);
+    };
   }
 
   /**
@@ -1893,9 +1900,13 @@ async function main() {
     const resolved = resolveVoicePathForV2(voiceRef);
     // 音量参数校验前置（AI 传错时给出可读错误，而不是让 ffmpeg 报奇怪的错）
     if (audio) resolveAudioProcessing({ volume: audio.volume ?? vc.defaultVolume, normalize: audio.normalize === true, loudness: audio.loudness ?? vc.loudness });
-    voiceBudgetCheck(key, vc);
-    const sent = await sendVoiceV2(key, resolved.path, { guard: true, audit: true, audio });
-    voiceBudgetCommit(key);
+    const settleBudget = reserveVoiceBudget(key, vc);
+    let sent;
+    try {
+      sent = await sendVoiceV2(key, resolved.path, { guard: true, audit: true, audio });
+    } finally {
+      settleBudget(Boolean(sent));
+    }
     recordVoiceSentV2(key, sent, label);
     log(`[voice] ${key} 已发送语音 ${path.basename(resolved.path)} (${sent.detail}, messageId=${sent.messageId ?? '?'})`);
     appendActivity(`${key} [voice] 发送语音 ${path.basename(resolved.path)} (${sent.detail})`);
@@ -5714,19 +5725,22 @@ async function main() {
             limits: { maxSeconds: voice.maxSeconds, maxBytes: voice.maxBytes, maxPerMinute: voice.maxPerMinute, maxPerHour: voice.maxPerHour }
           };
           if (body.dryRun === true) { sendJson({ ok: true, dryRun: true, ...preview }); return; }
-          const now = Date.now();
           try {
-            voiceBudgetCheck('operator:cli', voice);
-            const sent = await sendVoiceV2(key, resolved.path, {
-              guard: false,
-              audit: true,
-              audio: {
-                volume: body.volume ?? voice.defaultVolume,
-                normalize: body.normalize === true,
-                loudness: body.loudness ?? voice.loudness
-              }
-            });
-            voiceBudgetCommit('operator:cli', now);
+            const settleBudget = reserveVoiceBudget('operator:cli', voice);
+            let sent;
+            try {
+              sent = await sendVoiceV2(key, resolved.path, {
+                guard: false,
+                audit: true,
+                audio: {
+                  volume: body.volume ?? voice.defaultVolume,
+                  normalize: body.normalize === true,
+                  loudness: body.loudness ?? voice.loudness
+                }
+              });
+            } finally {
+              settleBudget(Boolean(sent));
+            }
             log(`[voice] (操作者) ${key} 已发送语音 ${path.basename(resolved.path)} (${sent.detail}${sent.audioMode === 'original' ? '' : '，' + sent.audioProcessing}, messageId=${sent.messageId ?? '?'})`);
             appendActivity(`${key} [voice] (操作者) 发送语音 ${path.basename(resolved.path)} (${sent.detail})`);
             // CLI 默认要落地校验（--verify 之外也能给出可信证据）；readback 仅在做"收到的语音"实验时用。
@@ -5826,7 +5840,6 @@ async function main() {
               warnings: sent.warnings
             });
           } catch (error) {
-            // 额度只在真正发出后才记账（voiceBudgetCommit），所以失败路径无需回滚。
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
           return;
