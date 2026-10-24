@@ -10,6 +10,7 @@ config.json
 *.bak-*
 
 # Local development / planning / research docs (not part of public project)
+/.audit/
 /PROJECT_GUIDE.md
 /ARCH_REVIEW.md
 /DSH_QQ_TOOLS_PLAN.md
