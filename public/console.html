@@ -949,6 +949,8 @@ tr:last-child td {
   padding:28px;
   box-shadow:var(--shadow-modal)
 }
+#consoleLoginDialog::backdrop { background:var(--overlay); backdrop-filter:blur(3px) }
+#consoleLoginToken { width:100% }
 .modal h3 {
   margin:0 0 12px;
   font-size:18px
@@ -1789,6 +1791,7 @@ button:active:not(:disabled) {
         <div class="search-wrap"><label class="sr-only" for="consoleSearch">搜索功能或参数</label><input id="consoleSearch" type="search" placeholder="搜索功能或参数…" autocomplete="off" aria-controls="searchResults" aria-expanded="false"><div id="searchResults" class="search-results" hidden></div></div>
       </div>
       <div id="connectionAlert" class="connection-alert" role="alert" hidden></div>
+      <div id="consoleAuthNotice" class="connection-alert" role="status" hidden>尚未登录，自动刷新已暂停。<button id="consoleLoginOpen" type="button" class="small">登录控制台</button></div>
       <div id="overviewSummary" class="overview-summary span-all" data-page="overview">
         <div class="metric"><span>DSH 连接</span><strong id="metricDsh">连接中</strong><small id="metricDshHint">等待服务响应</small></div>
         <div class="metric"><span>SnowLuma 上游</span><strong id="metricSnowluma">读取中</strong><small id="metricSnowlumaHint">等待网关健康上报</small></div>
@@ -2635,6 +2638,19 @@ button:active:not(:disabled) {
     </div>
 
 
+  <dialog id="consoleLoginDialog" class="modal" aria-labelledby="consoleLoginTitle" aria-describedby="consoleLoginHelp">
+    <form id="consoleLoginForm">
+      <h3 id="consoleLoginTitle">登录控制台</h3>
+      <p id="consoleLoginHelp" class="meta">访问令牌已失效。登录后继续加载，等待期间自动刷新已暂停。</p>
+      <label for="consoleLoginToken">访问令牌</label>
+      <input id="consoleLoginToken" type="password" autocomplete="off" required autofocus>
+      <p id="consoleLoginError" class="meta err" role="alert"></p>
+      <div class="row">
+        <button id="consoleLoginSubmit" type="submit">登录并继续</button>
+        <button id="consoleLoginCancel" type="button" class="small">稍后登录</button>
+      </div>
+    </form>
+  </dialog>
   <div class="toast" id="consoleToast" role="status" hidden></div>
   <noscript><div class="connection-alert">控制台需要启用 JavaScript 才能加载状态及保存设置。</div></noscript>
 
@@ -2649,26 +2665,102 @@ button:active:not(:disabled) {
   }
 })();
 
+const consoleAuth = { phase: 'ready', pending: null, generation: 0 };
+const consoleLoginDialog = document.getElementById('consoleLoginDialog');
+const consoleLoginForm = document.getElementById('consoleLoginForm');
+const consoleLoginToken = document.getElementById('consoleLoginToken');
+const consoleLoginError = document.getElementById('consoleLoginError');
+const consoleLoginSubmit = document.getElementById('consoleLoginSubmit');
+
+function requestConsoleLogin() {
+  if (consoleAuth.pending) return consoleAuth.pending.promise;
+  consoleAuth.phase = 'required';
+  localStorage.removeItem('consoleToken');
+  document.getElementById('consoleAuthNotice').hidden = false;
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  consoleAuth.pending = { promise, resolve };
+  consoleLoginError.textContent = '';
+  consoleLoginSubmit.disabled = false;
+  consoleLoginToken.value = '';
+  consoleLoginDialog.showModal();
+  consoleLoginToken.focus();
+  return promise;
+}
+
+function cancelConsoleLogin() {
+  const pending = consoleAuth.pending;
+  consoleAuth.pending = null;
+  consoleAuth.phase = 'required';
+  consoleAuth.generation++;
+  consoleLoginToken.value = '';
+  consoleLoginDialog.close();
+  pending?.resolve(false);
+}
+
+consoleLoginDialog.addEventListener('cancel', event => {
+  event.preventDefault();
+  cancelConsoleLogin();
+});
+document.getElementById('consoleLoginCancel').addEventListener('click', cancelConsoleLogin);
+document.getElementById('consoleLoginOpen').addEventListener('click', async () => {
+  if (await requestConsoleLogin()) refreshConsoleData();
+});
+consoleLoginForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  const token = consoleLoginToken.value.trim();
+  const pending = consoleAuth.pending;
+  if (!pending || consoleAuth.phase === 'validating' || !token) return;
+  consoleAuth.phase = 'validating';
+  consoleLoginSubmit.disabled = true;
+  consoleLoginError.textContent = '';
+  try {
+    const response = await fetch('/api/status', { headers: { 'x-console-token': token } });
+    if (consoleAuth.pending !== pending) return;
+    if (response.status === 401) throw new Error('令牌无效，请重新输入。');
+    if (!response.ok) throw new Error('暂时无法验证令牌，请稍后重试。');
+    localStorage.setItem('consoleToken', token);
+    consoleAuth.phase = 'ready';
+    consoleAuth.pending = null;
+    consoleAuth.generation++;
+    document.getElementById('consoleAuthNotice').hidden = true;
+    consoleLoginToken.value = '';
+    consoleLoginDialog.close();
+    pending.resolve(true);
+  } catch (error) {
+    if (consoleAuth.pending !== pending) return;
+    consoleAuth.phase = 'required';
+    consoleLoginError.textContent = error?.message || '暂时无法验证令牌，请稍后重试。';
+    consoleLoginToken.focus();
+  } finally {
+    if (consoleAuth.pending === pending) consoleLoginSubmit.disabled = false;
+  }
+});
+
 async function api(path, method, body, _retried = 0) {
+  if (consoleAuth.phase !== 'ready') {
+    if (!consoleAuth.pending || !await consoleAuth.pending.promise) throw new Error('未授权');
+  }
   const headers = body ? {'content-type':'application/json'} : {};
   const token = localStorage.getItem('consoleToken');
+  const generation = consoleAuth.generation;
   if (token) headers['x-console-token'] = token;
   const res = await fetch(path, { method: method || 'GET', headers, body: body ? JSON.stringify(body) : undefined });
   if (res.status === 401) {
-    if (_retried >= 2) {
-      localStorage.removeItem('consoleToken');
+    if (_retried >= 1) {
+      if (generation === consoleAuth.generation && token === localStorage.getItem('consoleToken')) requestConsoleLogin();
       throw new Error('未授权');
     }
-    const t = prompt('请输入控制台访问令牌：');
-    if (t) {
-      localStorage.setItem('consoleToken', t.trim());
-      return api(path, method, body, _retried + 1);
+    if (generation !== consoleAuth.generation) {
+      if (consoleAuth.phase !== 'ready') throw new Error('未授权');
+    } else if (token === localStorage.getItem('consoleToken') || consoleAuth.pending) {
+      if (!await requestConsoleLogin()) throw new Error('未授权');
     }
-    localStorage.removeItem('consoleToken');
-    throw new Error('未授权');
+    return api(path, method, body, _retried + 1);
   }
   return res.json();
 }
+
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 // 上游静默时长的人话渲染：只用于 SnowLuma 健康提示（秒 / 分钟 / 小时）。
 function fmtAgoMs(ms) {
@@ -5055,10 +5147,16 @@ document.getElementById('usageClear').addEventListener('click', async () => {
 
 setConsolePage(location.hash.slice(1), { updateHash:false });
 
-refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
-setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang(); }, 3000);
+function refreshConsoleData() {
+  return Promise.allSettled([refresh, refreshRoles, refreshWhitelist, refreshSessions, refreshPending, refreshPresets, loadSocialForm, loadV2Config, refreshV2Activity, loadV2ToolLog, loadV2SessionOptions, refreshSocialStatus, refreshSlang, loadSlangConfig, loadSecurity, refreshSimPrompt, refreshDshModel, refreshUsage, refreshUsageChart, refreshUsageRecent].map(load => load()));
+}
+refreshConsoleData();
+setInterval(() => {
+  if (consoleAuth.phase !== 'ready') return;
+  Promise.allSettled([refresh, refreshSessions, refreshPending, refreshSocialStatus, refreshSlang].map(load => load()));
+}, 3000);
 // 用量看板只在本页可见时轮询：既保证「实时」，又不让其它页白白多打两份接口。
-setInterval(() => { if (currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);
+setInterval(() => { if (consoleAuth.phase !== 'ready' || currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);
 // 主题切换（纯前端，不发任何请求；选择写入 localStorage，未选择时跟随系统）
 (function () {
   var root = document.documentElement;
