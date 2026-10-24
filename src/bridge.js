@@ -32,6 +32,7 @@ import { createStickerCache } from './sticker-cache.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
+import { createPromptDelivery } from './prompt-delivery.js';
 import {
   loadSlang,
   saveSlang,
@@ -2432,6 +2433,8 @@ async function main() {
     }
   }
   const collectors = new Map(); // sessionId -> turn collector
+  state.delivery ??= {};
+  const delivery = createPromptDelivery(state.delivery, saveState);
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
@@ -2620,15 +2623,15 @@ async function main() {
   const queueRetries = new Map(); // key -> 连续补投失败次数（用于退避/暂停恢复）
 
   // reset 竞态导致 ensureSession 抛「会话创建期间已重置」时，把消息放回队列稍后重试。
-  // 已在队列中的相同文本不重复入队。
   const enqueueForRetry = (key, promptText, opts = {}) => {
     const items = queued.get(key) ?? [];
-    if (!items.some((it) => it.promptText === promptText)) {
+    opts.requestId ??= crypto.randomUUID();
+    if (!items.some((it) => it.requestId === opts.requestId)) {
       if (items.length >= QUEUE_MAX) {
         items.shift();
         log(`队列满（${QUEUE_MAX}），丢弃最旧消息 (${key})`);
       }
-      items.push({ promptText, farewell: !!opts.farewell, silent: !!opts.silent, media: opts.media ?? [], wakeReason: opts.wakeReason });
+      items.push({ ...opts, promptText });
       queued.set(key, items);
     }
     queueRetries.delete(key); // 新消息入队视为新的机会，重置退避计数
@@ -2860,6 +2863,7 @@ async function main() {
 
   let flushingQueue = false;
   let flushQueueAgain = false;
+  const recoveringKeys = new Set();
   const flushQueue = async () => {
     // 尾沿重跑：单飞锁只是「别并发跑」，不能把后来的请求直接丢掉。
     // 旧写法在 flush 正在 await 时（一次失败可能卡上 60 秒）把重试定时器的调用直接 return，
@@ -2868,6 +2872,7 @@ async function main() {
     flushingQueue = true;
     try {
       const entries = [...queued.entries()];
+      for (const [key] of entries) recoveringKeys.add(key);
       queued.clear();
       for (const [key, items] of entries) {
         let sent = 0;
@@ -2881,8 +2886,9 @@ async function main() {
               log(`补投跳过未授权会话 ${key}（当前模式 ${currentMode}）`);
               continue;
             }
-            const result = await deliverPrompt(key, item.promptText, { farewell: item.farewell, silent: item.silent, media: item.media ?? [], wakeReason: item.wakeReason });
+            const result = await deliverPrompt(key, item.promptText, { ...item, fromRecovery: true });
             if (!result.ok) {
+              if (result.retryOpts) Object.assign(item, result.retryOpts);
               log(`补投失败 ${key}: ${result.error || '未知错误'}`);
               failed += 1;
               const rest = items.slice(i);
@@ -2919,6 +2925,7 @@ async function main() {
         }
       }
     } finally {
+      recoveringKeys.clear();
       flushingQueue = false;
       if (flushQueueAgain) {
         flushQueueAgain = false;
@@ -9237,6 +9244,20 @@ async function main() {
   // 实际的 DSH prompt 投递（不再直接对外暴露，统一走 promptQueues 串行队列）。
   async function deliverPromptNow(key, promptText, opts = {}) {
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
+    if (opts.sessionId && !isCurrentSession(key, opts.sessionId)) return { ok: true, skipped: true };
+    if (opts.sessionId && ['observed', 'handled'].includes(delivery.status(opts.sessionId, opts.requestId))) return { ok: true };
+    const mappedSession = state.sessions[key];
+    if (!opts.fromRecovery && !opts.wakeReason && (queued.has(key) || recoveringKeys.has(key))) {
+      enqueueForRetry(key, promptText, opts);
+      return { ok: true, queued: true };
+    }
+    if (mappedSession && delivery.uncertain(mappedSession)) {
+      if (!opts.fromRecovery && !opts.wakeReason) {
+        enqueueForRetry(key, promptText, opts);
+        return { ok: true, queued: true };
+      }
+      return { ok: false, uncertain: true, error: '等待 DSH 确认先前请求是否已接受' };
+    }
     // Recheck queued wakes at dispatch time: no model call while paused/disabled
     // and no reserved2 prompt leaking into an ordinary chat after a mode switch.
     const wakeBlocked = () => opts.wakeReason && (currentMode !== 'reserved2' || socialV2.paused || cfg.socialV2?.enabled === false);
@@ -9247,12 +9268,13 @@ async function main() {
     };
     if (wakeBlocked()) return skipWake();
     if (!dshReady) {
+      if (opts.fromRecovery) return { ok: false, error: 'DSH 尚未恢复' };
       const items = queued.get(key) ?? [];
       if (items.length >= QUEUE_MAX) {
         items.shift();
         log(`队列满（${QUEUE_MAX}），丢弃最旧消息 (${key})`);
       }
-      items.push({ promptText, farewell: !!opts.farewell, silent: !!opts.silent, media: opts.media ?? [], wakeReason: opts.wakeReason });
+      items.push({ ...opts, promptText });
       queued.set(key, items);
       return { ok: true, queued: true };
     }
@@ -9264,7 +9286,10 @@ async function main() {
         enqueueForRetry(key, promptText, opts);
         return { ok: true, retried: true };
       }
-      throw error;
+      if (opts.wakeReason) throw error;
+      if (opts.fromRecovery) return { ok: false, error: '会话创建失败', retryOpts: opts };
+      enqueueForRetry(key, promptText, opts);
+      return { ok: true, queued: true };
     }
     let wakeState;
     let wakeToken;
@@ -9290,19 +9315,28 @@ async function main() {
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     if (opts.farewell) social.exitingSessions.add(sessionId);
     let accepted;
+    opts.sessionId = sessionId;
+    delivery.request(sessionId, opts.requestId, 'submitting', opts);
     try {
-      accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content });
+      accepted = await api.sessions.prompt({ sessionId, requestId: opts.requestId, mode: 'queue', content });
     } catch (error) {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
-      throw error;
+      delivery.request(sessionId, opts.requestId, error?.delivery === 'not-sent' ? 'ready' : 'uncertain', opts);
+      if (opts.wakeReason && error?.delivery === 'not-sent') throw error;
+      if (opts.fromRecovery) return { ok: false, error: '等待 DSH 恢复或确认接受状态', retryOpts: opts };
+      enqueueForRetry(key, promptText, opts);
+      log(`请求 ${opts.requestId} ${error?.delivery === 'not-sent' ? '明确未发送，已排队重试' : '接受结果不确定，保留队列等待事件确认'} (${key})`);
+      return { ok: true, queued: true };
     }
     if (!accepted.result.ok) {
+      delivery.request(sessionId, opts.requestId, 'rejected', opts);
       if (opts.farewell) social.exitingSessions.delete(sessionId);
       const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
       const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
       if (!opts.silent) await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
       return { ok: false, error: safeErrText };
     }
+    delivery.request(sessionId, opts.requestId, 'accepted', opts);
     if (wakeSnapshot && isCurrentSession(key, sessionId)
         && socialV2.conversations.get(canonicalV2Key(key)) === wakeState
         && wakeState.agentToken === wakeToken) {
@@ -9316,12 +9350,13 @@ async function main() {
     } else if (accepted.result.value.command?.text && opts.silent && opts.farewell) {
       social.exitingSessions.delete(sessionId);
     }
-    return { ok: true };
+    return { ok: true, command: Boolean(accepted.result.value.command) };
   }
 
   // 每个 QQ 会话串行投递 DSH prompt，保证 turn 完成顺序与提交顺序一致，
   // 从而让 [SILENT]、摘要静默、退场标记都能准确匹配到自己的 turn。
   function deliverPrompt(key, promptText, opts = {}) {
+    opts = { ...opts, requestId: opts.requestId ?? crypto.randomUUID() };
     return new Promise((resolve, reject) => {
       let entry = promptQueues.get(key);
       if (!entry) {
@@ -10618,7 +10653,7 @@ async function main() {
     try {
       pendingWakeKeys.add(key);
       armPendingWakeLease(key);
-      const result = await deliverPrompt(key, promptText, { wakeReason: reason });
+      const result = await deliverPrompt(key, promptText, { wakeReason: reason, requestId: retry ? (retry.requestId ??= crypto.randomUUID()) : undefined });
       if (result && result.ok === false) {
         pendingWakeKeys.delete(key);
         disarmPendingWakeLease(key);
@@ -11273,56 +11308,16 @@ async function main() {
       return;
     }
 
-    // DSH 重启容错：DSH 不可用时消息入队（不丢），恢复后自动补投
-    if (!dshReady) {
-      const items = queued.get(key) ?? [];
-      if (items.length >= QUEUE_MAX) {
-        items.shift();
-        log(`队列满（${QUEUE_MAX}），丢弃最旧消息 (${key})`);
-      }
-      items.push({ promptText, media: mediaList });
-      queued.set(key, items);
+    const result = await deliverPrompt(key, promptText, { media: mediaList });
+    if (result.queued) {
       const now = Date.now();
       if ((queuedHintAt.get(key) ?? 0) + QUEUE_HINT_COOLDOWN_MS < now) {
         queuedHintAt.set(key, now);
-        await sendToQQ(key, '⏳ 系统服务重启中，消息已排队，恢复后自动处理。');
+        await sendToQQ(key, '⏳ 消息已保留，正在等待系统服务恢复或确认接受状态。');
       }
-      log(`DSH 不可用，消息入队 (${key})`);
       return;
     }
-
-    let sessionId;
-    try {
-      sessionId = await ensureSession(key);
-    } catch (error) {
-      if (String(error?.message ?? error).includes('会话创建期间已重置')) {
-        enqueueForRetry(key, promptText, { media: mediaList });
-        return;
-      }
-      throw error;
-    }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
-    if (Array.isArray(mediaList) && mediaList.length > 0) {
-      const imageParts = await resolveMediaList(mediaList);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
-    }
-    if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
-    const accepted = await api.sessions.prompt({
-      sessionId,
-      mode: 'queue',
-      content
-    });
-    if (!accepted.result.ok) {
-      const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
-      const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
-      await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
-      return;
-    }
-    if (accepted.result.value.command) {
-      // 斜杠命令直接有结果，不走模型
-      if (accepted.result.value.command.text) await auditAndSend(key, mdToPlain(accepted.result.value.command.text));
-      return;
-    }
+    if (!result.ok || result.skipped || result.command) return;
     if (cfg.ackMessage && currentMode !== 'reserved2') await sendToQQ(key, cfg.ackMessage);
     log(`已投递 ${key}: ${promptText.slice(0, 80)}${promptText.length > 80 ? '…' : ''}`);
   }
@@ -11501,6 +11496,8 @@ async function main() {
    *      collector，否则同样会永久繁忙。
    */
   function trackTurnEvent(sessionId, event) {
+    if (event?.type === 'turn/start' && !delivery.start(sessionId, event.data?.turn)) return { collector: null, ended: null };
+    if (delivery.observe(sessionId, event) && queued.size) setTimeout(() => { flushQueue(); }, 0);
     let collector = collectors.get(sessionId);
     if (!collector && event?.type === 'turn/start') {
       collector = createTurnCollector();

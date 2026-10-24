@@ -62,7 +62,7 @@ try {
   h.api.sessions.prompt = async (params) => {
     attempts++;
     attemptTimes.push(now);
-    if (attempts <= 9) throw new Error('fixture transient failure');
+    if (attempts <= 9) throw Object.assign(new Error('fixture transient failure'), { delivery: 'not-sent' });
     h.calls.prompts.push(params);
     return { result: { ok: true, value: {} } };
   };
@@ -133,7 +133,7 @@ try {
       let began;
       const started = new Promise((resolve) => { began = resolve; });
       const gate = new Promise((resolve) => { release = resolve; });
-      h.api.sessions.prompt = async () => { attempts++; began(); if (phase === 'inflight') await gate; throw new Error('fixture late failure'); };
+      h.api.sessions.prompt = async () => { attempts++; began(); if (phase === 'inflight') await gate; throw Object.assign(new Error('fixture late failure'), { delivery: 'not-sent' }); };
       const sending = h.sendWakePromptV2(key, 'timeout');
       await started;
       if (phase === 'scheduled') {

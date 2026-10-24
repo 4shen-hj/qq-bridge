@@ -570,6 +570,7 @@ export class NodeApiClient extends AbstractApiClient {
           if (authEpoch === this._authEpoch) this.invalidateAuth();
           return this._doFetchWithAuth(input, init, true);
         }
+        error.delivery = 'not-sent';
         throw error;
       }
     }
@@ -600,12 +601,19 @@ export class NodeApiClient extends AbstractApiClient {
     const endpoint = endpointOf(method);
     const message = {
       type: 'client-request',
-      rpcId: this.mintRpcId(),
+      rpcId: endpoint === 'session/prompt' && payload?.requestId ? payload.requestId : this.mintRpcId(),
       method: endpoint,
       payload: wrapArgs(method, payload)
     };
     this.onEnvelope(message);
-    const response = await this.postJson(`/api/${endpoint}`, message, signal, timeoutPolicy);
+    let response;
+    try {
+      response = await this.postJson(`/api/${endpoint}`, message, signal, timeoutPolicy);
+    } catch (error) {
+      const code = error?.cause?.code ?? error?.code;
+      if (['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) error.delivery = 'not-sent';
+      throw error;
+    }
     const full = await response.json();
     if (!full || full.type !== 'server-response' || full.rpcId !== message.rpcId || !full.result) {
       throw new Error(`invalid server-response for ${endpoint}`);

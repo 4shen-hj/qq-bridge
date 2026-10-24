@@ -11,6 +11,7 @@ const tests = [
   'test-wake-queue-drain.mjs',
   'test-voice-quota.mjs',
   'test-group-members-auth.mjs',
+  'test-prompt-admission.mjs',
   'test-wake-delivery-retry.mjs', 'test-voice-authorization-race.mjs',
   'test-preset-publication.mjs', 'test-agent-preset-patches.mjs',
   'test-restart-safety.mjs', 'test-console-safety.mjs',
