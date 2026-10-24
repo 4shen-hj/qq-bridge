@@ -9,8 +9,7 @@
     "notes/",
     "*.private.md"
   ],
-  "allowPaths": [
-    "docs/guides/VOICE.md",
-    "scripts/console-ui-"
+  "allowMatches": [
+    { "path": "docs/guides/PRIVACY.md", "rule": "QQ 号/群号（9-10 位连续数字）", "value": "123456789" }
   ]
 }

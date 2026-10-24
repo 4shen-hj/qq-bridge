@@ -16,10 +16,12 @@ node scripts/privacy-scan.mjs --tracked-only # 只扫 git 已跟踪文件
 node scripts/privacy-scan.mjs --json         # 机读输出（给 CI 用）
 ```
 
-退出码：`0` = 干净，`1` = 有命中（**必须逐个判读**），`2` = 规则文件坏了或目录扫不动。
+退出码：`0` = 扫描完整且没有命中，`1` = 扫描完整但有命中，`2` = 扫描不完整。命中必须逐个判读。
 
-它扫描：`git ls-files` + 未被 ignore 的未跟踪文件（git 不可用时退化为目录遍历，并尽力套用 `.gitignore`；
-遍历会跳过 junction/symlink，免得被指回自身的联接搞成无限递归）。
+它扫描 `git ls-files` 与未被 ignore 的未跟踪文件。Git 枚举失败、规则无效、文件不可读、
+符号链接、文本超过 8 MiB 或匹配预算耗尽时，扫描返回不完整，不报告成功。
+JSON 输出的 `complete` 与 `incomplete` 字段记录完整性，`skippedBinary` 记录未检查内容的二进制文件数。
+报告只显示规则、文件与行号，不回显匹配值。扫描只检查当前文件，不检查 Git 历史。
 
 ## 二、内置规则（挡住最常见的泄漏）
 
@@ -27,8 +29,8 @@ node scripts/privacy-scan.mjs --json         # 机读输出（给 CI 用）
 | --- | --- |
 | 本机绝对路径 | `C:\Users\<名字>\…` 与 `D:\<工作盘>\…` 这类工作盘路径 |
 | QQ 号 / 群号 | 9–10 位连续数字（真实账号长度；文档里的 `123456789` 属占位符） |
-| 高熵串 | 疑似令牌/密钥。**过滤掉**全 hex（git SHA）、全大写下划线（环境变量名）、小写文件名式串 —— 真凭据是"大小写+数字混合" |
-| 凭据赋值 | `accessToken: "<12 位以上实际值>"` 形态（空值/模板不算，避免噪音） |
+| 高熵串 | 检查至少 32 字符的串，过滤全 hex、全大写标识符及小写文件名式串。此过滤仅作用于本规则，可能漏掉具有同样形态的凭据 |
+| 凭据赋值 | 检查引号内至少 12 字符的值，不把 `accessToken: config.token` 这类运行时读取当成凭据字面量 |
 | 私钥头 / 带凭据的 URL | `-----BEGIN … PRIVATE KEY-----`、`https://user:pass@host` |
 | 不应入库的文件 | `config.json`、`state/`、`audio/`、`*.log`、`*.bak*` |
 
@@ -38,7 +40,7 @@ node scripts/privacy-scan.mjs --json         # 机读输出（给 CI 用）
 | --- | --- |
 | **真实数据**（你的 QQ 号、群号、本机路径、令牌） | 换成占位符（`123456789` / `C:\path\to\…`），或把该文件移出版本控制 |
 | **该文件本来就不该入库** | 加进 `.gitignore`；若已提交过，见下面第四节 |
-| **误报**（脱敏模板、测试夹具、文档示例） | 加进白名单 —— 两种方式：<br>① 文件级：`scripts/privacy-rules.json` 的 `allowPaths`；<br>② 规则级：在同一文件里加一条更精确的 `deny` 规则覆盖默认规则 |
+| **误报**（脱敏模板、测试夹具、文档示例） | 在 `scripts/privacy-rules.json` 的 `allowMatches` 中指定文件、规则名和完整匹配值。相同文件中的其他命中仍会报告 |
 
 ### `scripts/privacy-rules.json`（可选的本地规则文件）
 
@@ -52,12 +54,16 @@ node scripts/privacy-scan.mjs --json         # 机读输出（给 CI 用）
     { "name": "我的真实群号", "pattern": "1001[0-9]{6}", "flags": "" }
   ],
   "denyFiles": ["notes/", "*.private.md"],
-  "allowPaths": ["docs/guides/VOICE.md", "scripts/console-ui-"]
+  "allowMatches": [
+    { "path": "docs/guides/PRIVACY.md", "rule": "QQ 号/群号（9-10 位连续数字）", "value": "123456789" }
+  ]
 }
 ```
 
-`allowPaths` 支持前缀或 `*` 通配。**加入白名单前先确认那个文件里确实只有占位数据**——
-白名单是"误报豁免"，不是"这个文件不用检查"。
+`allowMatches.path` 支持完整路径与 `*` 通配，`rule` 与 `value` 必须精确相等。
+先核实匹配值是示例，再添加例外。`deny` 中的本地规则与默认规则都会执行，不能覆盖默认规则。
+旧 `allowPaths` 已停止放行文件。保留非空 `allowPaths` 会让扫描返回退出码 2，迁移为精确例外后再删除该字段。
+每个文件的每条规则最多显示 3 处命中，匹配仍会继续检查，超出预算则明确返回不完整。
 
 ## 四、已经提交进去了怎么办
 
@@ -90,6 +96,6 @@ CI 上只扫**已跟踪**文件（未跟踪文件在干净 checkout 里不存在
 | `src/bridge.js` | `accessToken` 键名（配置读取处，无真实值） | 误报：键名不是值；已在规则里区分"有实际值" |
 | `docs/guides/PROJECT_GUIDE.md`、`docs/guides/VOICE.md` | 真实 QQ 号/群号、`C:\Users\<名字>`、`D:\<工作盘>` | **不带进新仓库**（旧项目的实现说明，已被 `QSH_PLAN.md` 取代） |
 | `docs/audits/*`、`docs/design/*`、`docs/research/*`、`docs/legacy/*` | 本机路径、真实 QQ 号 | 同上：**不带进新仓库**；只把 `AUDIT_FIXES` 与 `SECURITY_BASELINE` 带走（这两份已确认只含占位符） |
-| `scripts/test-*`、`scripts/console-ui-*`、`src/sensitive.js`、`config.example.json` | 刻意构造的假 ID / 假凭据 / 占位符 | 误报：已在 `allowPaths` 白名单里 |
+| `scripts/test-*`、`scripts/console-ui-*`、`src/sensitive.js`、`config.example.json` | 刻意构造的假 ID / 假凭据 / 占位符 | 当时按文件放行；现已取消，新增或遗留示例须按匹配值逐项确认 |
 
 **结论**：真正必须在**代码**里改掉的只有 `public/console.html` 的群号；其余全部靠"不带进新仓库"解决。
