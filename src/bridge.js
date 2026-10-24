@@ -2531,52 +2531,9 @@ async function main() {
         provider: known?.provider ?? cfg.dsh?.provider
       });
       tokenLedger.ingestSnapshotRecords({ sessionId, records: snapshot.records });
-      rebuildInFlightCollector(sessionId, snapshot.records);
     } catch (error) {
       log('token 账本：处理会话快照失败', error?.message ?? error);
     }
-  }
-
-  /**
-   * 重连后重建「断线时正在跑的那个回合」的 collector。
-   *
-   * 为什么必须有这一步：`pumpMux` 的 finally 会在断线时清空 `collectors`（否则重连后
-   * 旧状态会让回复重复累加）。而重连时 DSH **只**通过开场快照重放历史 —— 快照被刻意
-   * 排除在事件通道之外（否则历史回合会被当成新回合重复发送）。于是断线前发出的
-   * `turn/start` 再也补不回来：重连后到达的 live `turn/end` 找不到对应回合，
-   * `createTurnCollector.push()` 返回 null ⇒ **这一轮的回复被静默丢弃**（QQ 上没消息、
-   * 日志里没记录、token 却照付）。
-   *
-   * 修法：只把「有 turn/start 但没有 turn/end」的回合重放进 collector ——
-   * 这些正是断线那一刻仍在进行的回合。已结束的回合一律不喂，所以不会重复回复。
-   */
-  function rebuildInFlightCollector(sessionId, records) {
-    if (!Array.isArray(records) || !records.length) return;
-    const eventOf = (entry) => (entry?.type === 'event' ? entry.event : entry);
-    const open = new Set();
-    for (const entry of records) {
-      const event = eventOf(entry);
-      if (event?.type === 'turn/start') open.add(event.data?.turn);
-      else if (event?.type === 'turn/end') open.delete(event.data?.turn);
-    }
-    if (!open.size) return;
-    const collector = createTurnCollector();
-    let restored = 0;
-    for (const entry of records) {
-      const event = eventOf(entry);
-      // 只回放未结束回合的文本来源：turn/start 建立回合，assistant/message 累积文本。
-      if (event?.type !== 'turn/start' && event?.type !== 'assistant/message') continue;
-      if (!open.has(event.data?.turn)) continue;
-      collector.push(event);
-      restored += 1;
-    }
-    if (!restored) return;
-    collectors.set(sessionId, collector);
-    // 恢复出来的回合也必须带起始时间，否则租约对它无从生效 —— 这正是
-    // 「DSH 重启后忙标记永不复位」的那条路径（issue #19）。不知道真实起点时按现在算：
-    // 活着的回合会在 turn/end 清掉；真丢了的回合最多再忙一个租约期就自动解除。
-    if (!v2TurnStartAt.has(sessionId)) v2TurnStartAt.set(sessionId, Date.now());
-    log(`重连后恢复了进行中的回合（${sessionId}，turn ${[...open].join(',')}）`);
   }
 
   // 唤醒“防卡死”租约：正常应在 turn/end 时删除 pendingWakeKeys；若 DSH 接受了但一直没回合结束，
@@ -11516,6 +11473,21 @@ async function main() {
     return { collector, ended };
   }
 
+  async function* recoverMuxFrames(stream) {
+    for await (const envelope of stream) {
+      const frame = envelope.payload;
+      if (frame.type !== 'session/snapshot' || !reverse.has(frame.sessionId)) {
+        yield envelope;
+        continue;
+      }
+      const events = delivery.snapshot(frame.sessionId, frame.snapshot);
+      collectors.delete(frame.sessionId);
+      yield envelope;
+      for (const event of events) yield { payload: { type: 'session/event', sessionId: frame.sessionId, event } };
+      if (queued.size) setTimeout(() => { flushQueue(); }, 0);
+    }
+  }
+
   async function pumpMux() {
     // 事件流重连退避：DSH 侧流被立刻关闭时（例如版本不兼容，见 issue #34），
     // 固定 3 秒重连会以每分钟 20 行的速度刷屏，真正有用的错误反而被淹没。
@@ -11525,11 +11497,9 @@ async function main() {
       let framesThisStream = 0;
       try {
         log('连接 DSH 事件流…');
-        for await (const envelope of api.events.mux({})) {
+        for await (const envelope of recoverMuxFrames(api.events.mux({}))) {
           framesThisStream += 1;
           const frame = envelope.payload;
-          // 会话开场快照：只喂 token 账本。它含**历史** turn/end，绝不能让它们走
-          // session/event 通道 —— 否则桥接会把早已结束的回合当成新回合去发 QQ 回复。
           if (frame.type === 'session/snapshot') {
             recordSessionSnapshot(frame.sessionId, frame.snapshot);
             continue;
@@ -11632,6 +11602,10 @@ async function main() {
             // collector 生命周期见 trackTurnEvent()：只为 turn/start 建、空壳 turn/end 即清。
             const { ended } = trackTurnEvent(frame.sessionId, frame.event);
             if (ended) {
+              // Claim before external side effects. QQ has no idempotent send receipt.
+              const receipt = delivery.finish(frame.sessionId, ended.turn);
+              if (!receipt) continue;
+              if (queued.size) setTimeout(() => { flushQueue(); }, 0);
               const completed = ended.reason.kind === 'completed';
               // reserved2 无行动兜底：正常完成的普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
@@ -11686,14 +11660,14 @@ async function main() {
                 }
               }
               // 标记本次 turn 是否为“活跃超时退场”发言（用于准确回到观望，避免把旧回复误判为退场）
-              const isFarewell = social.exitingSessions.has(frame.sessionId);
+              const isFarewell = receipt.farewell || social.exitingSessions.has(frame.sessionId);
               if (isFarewell) social.exitingSessions.delete(frame.sessionId);
               // 摘要投喂触发的 turn：回复静默（不发送到 QQ）。
               // 用 FIFO 时间戳队列 + 超时回收，避免计数残留吞掉后续正常回复。
               const silentQueue = social.silentTurns.get(frame.sessionId) ?? [];
               const silentNow = Date.now();
               while (silentQueue.length && silentNow - silentQueue[0].ts > SILENT_TURN_TIMEOUT_MS) silentQueue.shift();
-              const suppressTurnOutput = silentQueue.length > 0;
+              const suppressTurnOutput = receipt.silent ?? (silentQueue.length > 0);
               if (suppressTurnOutput) {
                 silentQueue.shift();
                 if (silentQueue.length > 0) social.silentTurns.set(frame.sessionId, silentQueue);
