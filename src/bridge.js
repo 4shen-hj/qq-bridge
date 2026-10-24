@@ -6,6 +6,7 @@
 //
 // 用法：node src/bridge.js （先编辑 ../config.json）
 import fs from 'node:fs';
+import { parsePromptSections, wakeVisibleMessages, selectWakeSlang, selectWakeMemory } from './qq-prompt-context.js';
 import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
@@ -2378,12 +2379,12 @@ async function main() {
       .map(publicSlangEntry);
   }
 
-  function withSlangContext(promptText) {
+  function withSlangContext(promptText, entries = slangEntries) {
     const now = new Date();
     const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
     const parts = [timeLine];
     if (cfg.slang?.enabled !== false) {
-      const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
+      const block = buildSlangContext(entries, cfg.slang?.injectMax ?? 8);
       if (block) parts.push(block);
     }
     return parts.join('\n\n') + '\n\n' + promptText;
@@ -4724,12 +4725,10 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getPrompt')) { sendJson({ ok: false, error: '工具未启用：qq_get_prompt' }, 403); return; }
+          let sections;
+          try { sections = parsePromptSections(url.searchParams.has('sections') ? url.searchParams.getAll('sections').join(',') : null); }
+          catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
           const st = getSocialV2State(key);
-          // 让 prompt 里的表情摘要尽量新鲜：按 TTL 同步一次 QQ 收藏表情（失败不阻塞）。
-          if (cfg.socialV2?.sticker?.enabled !== false) {
-            try { await syncStickerLibrary(false); } catch {}
-          }
-          const roleState = readRoleState();
           const toolMap = {
             getPrompt: 'qq_get_prompt',
             getUnread: 'qq_get_unread_messages',
@@ -4768,51 +4767,54 @@ async function main() {
           for (const [flag, name] of Object.entries(toolMap)) {
             if (tools[flag] !== false && !(stickerToolFlags.has(flag) && !stickerEnabled())) enabledTools.push(name);
           }
-          sendJson({
-            ok: true,
-            key,
-            time: new Date().toISOString(),
-            // 机器人自己的身份：agent 需要它才能把「@樰」对到自己身上（issue #29）。
-            self: {
+          const builders = {
+            self: () => ({
               nickname: selfDisplayName || null,
               userId: selfUserId || null,
               line: selfIdentityTextV2().trim() || null
-            },
-            role: { name: roleState.role ?? null, hint: currentMode === 'reserved2' ? currentRoleHintV2() : currentRoleHint() },
-            recommended: cfg.socialV2?.provideRecommendations === false ? null : {
+            }),
+            role: () => ({ name: readRoleState().role ?? null, hint: currentMode === 'reserved2' ? currentRoleHintV2() : currentRoleHint() }),
+            recommended: () => cfg.socialV2?.provideRecommendations === false ? null : {
               wake: cfg.socialV2?.wake ?? {},
               send: cfg.socialV2?.send ?? {},
               wait: cfg.socialV2?.wait ?? {},
               proactive: cfg.socialV2?.proactive ?? {}
             },
-            enabledTools,
-            replyTiming: replyTimingV2(st),
-            unreadCount: st.unread.length,
-            recentCount: st.recentMessages.length,
-            currentWakeConfig: st.wakeConfig,
-            wakeSafety: computeWakeSafetyV2(st.wakeConfig),
-            memory: formatMemoryV2(st),
-            participation: formatParticipationV2(st),
-            slang: {
+            enabledTools: () => enabledTools,
+            replyTiming: () => replyTimingV2(st),
+            unreadCount: () => st.unread.length,
+            recentCount: () => st.recentMessages.length,
+            currentWakeConfig: () => st.wakeConfig,
+            wakeSafety: () => computeWakeSafetyV2(st.wakeConfig),
+            memory: () => formatMemoryV2(st),
+            participation: () => formatParticipationV2(st),
+            slang: () => ({
               enabled: cfg.slang?.enabled !== false,
               entries: confirmedSlangListV2(),
               block: buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8)
+            }),
+            stickers: async () => {
+              if (cfg.socialV2?.sticker?.enabled !== false) {
+                try { await syncStickerLibrary(false); } catch {}
+              }
+              return {
+                enabled: cfg.socialV2?.sticker?.enabled !== false,
+                total: stickerEntries.length,
+                context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 8) : '',
+                strategy: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : ''
+              };
             },
-            stickers: {
-              enabled: cfg.socialV2?.sticker?.enabled !== false,
-              total: stickerEntries.length,
-              context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 8) : '',
-              strategy: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : ''
-            },
-            // 语音库摘要：让 AI 一开始就知道有哪些语音可发（真发之前用 qq_list_voices 看详情）。
-            voices: cfg.socialV2?.voice?.enabled === false ? { enabled: false } : {
+            voices: () => cfg.socialV2?.voice?.enabled === false ? { enabled: false } : {
               enabled: true,
               total: voiceLibrary().length,
               names: voiceLibrary().slice(0, 12).map((v) => v.name),
               maxSeconds: voiceCfg().maxSeconds,
               hint: '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去'
             }
-          });
+          };
+          const result = { ok: true, key, time: new Date().toISOString() };
+          for (const section of sections) result[section] = await builders[section]();
+          sendJson(result);
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/unread') {
@@ -9257,16 +9259,18 @@ async function main() {
       // offline queue may have received more messages since this wake was queued.
       wakeState = getSocialV2State(key);
       wakeToken = wakeState.agentToken;
-      promptText = buildWakePromptV2(key, opts.wakeReason);
       wakeSnapshot = buildWakeSnapshotV2(key);
+      promptText = buildWakePromptV2(key, opts.wakeReason, wakeSnapshot);
       if (wakeSnapshot) {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}`;
       }
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    const promptSlang = opts.wakeReason ? selectWakeSlang(slangEntries, wakeVisibleMessages(wakeSnapshot)) : slangEntries;
+    const enrichedPrompt = withSlangContext(promptText, promptSlang);
+    let content = [{ type: 'text', text: enrichedPrompt }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
       const imageParts = await resolveMediaList(opts.media);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      content = [{ type: 'text', text: enrichedPrompt }, ...imageParts];
     }
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
@@ -10387,21 +10391,21 @@ async function main() {
     return `【你的身份】${label}${idText}\n\n`;
   }
 
-  function buildWakePromptV2(key, reason) {
+  function buildWakePromptV2(key, reason, snapshot = null) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}\n\n`;
-    const memoryText = formatMemoryV2(st);
-    const memoryLine = memoryText ? `${memoryText}\n\n` : '';
+    const memoryText = formatMemoryV2(selectWakeMemory(st, wakeVisibleMessages(snapshot), reason));
+    const memoryLine = memoryText ? `【相关记忆资料】${JSON.stringify(memoryText)}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
     const participationLine = participationText ? `${participationText}\n\n` : '';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
-      ? `${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
+      ? `【可用表情包】${stickerEntries.length} 个\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const replyTiming = replyTimingV2(st);

@@ -29,7 +29,7 @@ let bridge;
 try {
   fixture = await fs.mkdtemp(path.join(root, '.tmp-input-probe-'));
   await fs.mkdir(path.join(fixture, 'src'));
-  for (const name of ['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js']) {
+  for (const name of ['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js', 'qq-prompt-context.js']) {
     await fs.copyFile(path.join(root, 'src', name), path.join(fixture, 'src', name));
   }
   await fs.writeFile(path.join(fixture, 'config.json'), '{}');

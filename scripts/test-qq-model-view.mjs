@@ -8,6 +8,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { compactModelMessage, compactModelData, serializeModelData } from '../src/qq-model-view.js';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
+import { PROMPT_SECTIONS } from '../src/qq-prompt-context.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const shortMessage = {
@@ -154,7 +155,7 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     // live config or user runtime state are copied into this test fixture.
     fixture = await fs.mkdtemp(path.join(ROOT, '.tmp-model-view-test-'));
     await fs.mkdir(path.join(fixture, 'src'));
-    await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js'].map((name) =>
+    await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js', 'qq-prompt-context.js'].map((name) =>
       fs.copyFile(path.join(ROOT, 'src', name), path.join(fixture, 'src', name))));
     await fs.writeFile(path.join(fixture, 'config.json'), JSON.stringify({ consolePort: api.address().port }));
     const transport = new StdioClientTransport({
@@ -184,6 +185,22 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     assert.deepEqual(waitSchema.properties.purpose.enum, ['messages', 'reply']);
     assert.equal(waitSchema.required.includes('purpose'), false);
     const common = { key: 'group:123', token: 'fixture-token' };
+    const promptSchema = listed.tools.find((tool) => tool.name === 'qq_get_prompt').inputSchema;
+    assert.deepEqual(promptSchema.properties.sections.items.enum, PROMPT_SECTIONS);
+    assert.equal(promptSchema.properties.sections.minItems, 1);
+    assert.equal(promptSchema.required.includes('sections'), false);
+    await client.callTool({ name: 'qq_get_prompt', arguments: common });
+    assert.equal(new URL(requests.at(-1).url, 'http://fixture').searchParams.has('sections'), false);
+    await client.callTool({ name: 'qq_get_prompt', arguments: { ...common, sections: ['role', 'memory'] } });
+    assert.equal(new URL(requests.at(-1).url, 'http://fixture').searchParams.get('sections'), 'role,memory');
+    assert.equal(requests.at(-1).token, common.token);
+    for (const sections of [[], ['unknown'], 'role']) {
+      const before = requests.length;
+      const invalid = await client.callTool({ name: 'qq_get_prompt', arguments: { ...common, sections } });
+      assert.equal(invalid.isError, true);
+      assert.equal(requests.length, before);
+    }
+
     const read = await client.callTool({ name: 'qq_get_unread_messages', arguments: common });
     const readText = read.content.find((part) => part.type === 'text').text;
     const data = JSON.parse(readText);

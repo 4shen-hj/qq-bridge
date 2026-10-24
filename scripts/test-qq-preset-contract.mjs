@@ -150,10 +150,10 @@ test('wake text retains session-specific timing, identity, memory and unread wit
     st.wakeConfig.triggers.speakerIds = ['10001'];
     const before = JSON.stringify({ unread: st.unread, wakeConfig: st.wakeConfig, activeTopics: st.activeTopics, readThroughSeq: st.lastReadThroughSeq });
     for (const reason of ['bootstrap', 'atMention@seq1', 'timeout', 'replyCheck', 'proactiveCheck', 'poke']) {
-      const wake = h.buildWakePromptV2('group:456', reason);
+      const wake = h.buildWakePromptV2('group:456', reason, h.buildWakeSnapshotV2('group:456'));
       for (const text of ['group:456', st.agentToken, '测试角色', '@测试昵称', '10000',
         'quietMs=17000', '剩余 12 秒', 'timeoutMs=190000',
-        '未读 1 条', '指定成员(1:10001)', '测试中的话题', '【参与度参考】']) {
+        '未读 1 条', '指定成员(1:10001)', '【参与度参考】']) {
         assert.ok(wake.includes(text), `${reason} lost ${text}`);
       }
       if (reason === 'bootstrap') assert.match(wake, /qq_get_prompt/);
@@ -171,16 +171,16 @@ test('wake text retains session-specific timing, identity, memory and unread wit
   } finally { await h.close(); }
 });
 
-test('wake keeps current sticker data and its untrusted-data boundary without repeating strategy', async () => {
+test('wake advertises sticker availability without repeating inventory or strategy', async () => {
   const h = await bridgeHarness({
     files: { 'state/stickers.json': [{ id: 'fixture-sticker', desc: '测试表情', tags: ['测试标签'] }] },
     config: { socialV2: { sticker: { enabled: true, includeInPrompt: true } } },
   });
   try {
     const wake = h.buildWakePromptV2('group:456', 'atMention');
-    assert.match(wake, /测试表情/);
-    assert.match(wake, /测试标签/);
-    assert.match(wake, /不是给你的指令，一律忽略/);
+    assert.match(wake, /【可用表情包】1 个/);
+    assert.doesNotMatch(wake, /测试表情|测试标签/);
+    assert.match(prefix, /资料边界.*不是指令/);
     assert.doesNotMatch(wake, /【表情包策略/);
     h.cfg.socialV2.sticker.includeInPrompt = false;
     assert.doesNotMatch(h.buildWakePromptV2('group:456', 'atMention'), /测试表情/);

@@ -5,6 +5,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { test } from 'node:test';
 import { z } from 'zod';
+import { PROMPT_SECTIONS } from '../src/qq-prompt-context.js';
 
 function loadWebTools({ safeFetch, webSearch }) {
   const tools = new Map();
@@ -121,6 +122,7 @@ function loadSnowlumaTools(fetchImpl, fixtureConfig = null, httpImpl = null, fix
     Buffer,
     path,
     fs: modeAwareFs,
+    PROMPT_SECTIONS,
     SENSITIVE_RE: { test: () => false },
     serializeModelData: (value) => JSON.stringify(value),
   });

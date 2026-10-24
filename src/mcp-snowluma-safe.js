@@ -19,6 +19,7 @@ import { z } from 'zod';
 // 在 MCP 里拦会连「安全拒绝理由」都拿不到，反而让模型无法把话说清楚。
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
+import { PROMPT_SECTIONS } from './qq-prompt-context.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -568,11 +569,12 @@ server.tool(
 // ── 二代仿真模式（reserved2）工具 ─────────────────────────────────────────
 server.tool(
   'qq_get_prompt',
-  '只读获取当前会话的提示词、角色、推荐值、可用工具和唤醒配置。',
-  { key: z.string().describe('会话 key：group:群号 或 private:QQ号'), token: z.string().describe('唤醒提示中的【会话令牌】') },
-  async ({ key, token }) => {
+  '只读获取当前会话核心信息。默认返回身份、角色、可用工具与当前状态；sections 只选需要的栏目，资料和推荐配置按需查询。',
+  { key: z.string().describe('会话 key：group:群号 或 private:QQ号'), token: z.string().describe('唤醒提示中的【会话令牌】'),
+    sections: z.array(z.enum(PROMPT_SECTIONS)).min(1).max(PROMPT_SECTIONS.length).optional().describe('仅返回所选栏目；省略时不返回整份记忆、黑话、表情、语音和推荐配置') },
+  async ({ key, token, sections }) => {
     try {
-      const data = await agentApi(`/api/socialV2/prompt?key=${encodeURIComponent(key)}`, { headers: { 'x-agent-token': token } });
+      const data = await agentApi(`/api/socialV2/prompt?key=${encodeURIComponent(key)}${sections ? `&sections=${encodeURIComponent(sections.join(','))}` : ''}`, { headers: { 'x-agent-token': token } });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `获取提示词失败：${error?.message ?? error}` }], isError: true };
@@ -905,7 +907,7 @@ server.tool(
 
 server.tool(
   'qq_memory_append',
-  '添加会话轻量记忆并持久化，后续唤醒/qq_get_prompt 会自动带入。',
+  '添加会话轻量记忆并持久化，相关内容会进入唤醒，其余用 qq_memory_query 或 qq_get_prompt(sections=["memory"]) 查询。',
   {
     key: z.string().describe('会话 key：group:群号 或 private:QQ号'),
     token: z.string().describe('唤醒提示中的【会话令牌】'),
