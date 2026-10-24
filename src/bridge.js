@@ -10778,32 +10778,39 @@ async function main() {
   function replayPendingWakeReasonsV2(key) {
     const st = getSocialV2State(key);
     if (!Array.isArray(st.pendingWakeReasons) || !st.pendingWakeReasons.length) return null;
-    const item = st.pendingWakeReasons.shift();
-    if (!item || typeof item !== 'object') return null;
-    if (isTimerWakeReason(item.reason)) {
-      if (item.reason === 'timeout') {
-        log(`[reserved2] ${key} 补收繁忙期间到期的潜水定时器`);
-        setupSleepTimerV2(key);
-      } else if (item.reason === 'replyCheck') {
-        log(`[reserved2] ${key} 补排繁忙期间的回复检查`);
-        scheduleReplyCheckV2(key);
-      } else if (item.reason === 'proactiveCheck') {
-        // 主动机会有周期性重排，错过一次可接受（也不该在回合结束时立刻补一刀）。
-        log(`[reserved2] ${key} 繁忙期间的主动机会已过期，跳过补发`);
-      } else {
-        log(`[reserved2] ${key} 补发繁忙期间积压的唤醒：${item.reason}`);
-        scheduleWakeV2(key, item.reason);
+    if (isConversationBusyV2(key, st)) return null;
+    let skipped = null;
+    while (st.pendingWakeReasons.length) {
+      const item = st.pendingWakeReasons.shift();
+      if (!item || typeof item !== 'object') continue;
+      if (isTimerWakeReason(item.reason)) {
+        if (item.reason === 'timeout') {
+          if (!st.wakeRetry && (st.wakeConfig?.infinite || !Number.isFinite(Date.parse(st.wakeConfig?.sleepUntil)))) continue;
+          log(`[reserved2] ${key} 补收繁忙期间到期的潜水定时器`);
+          setupSleepTimerV2(key);
+        } else if (item.reason === 'replyCheck') {
+          log(`[reserved2] ${key} 补排繁忙期间的回复检查`);
+          scheduleReplyCheckV2(key);
+        } else if (item.reason === 'proactiveCheck') {
+          // 主动机会有周期性重排，错过一次可接受（也不该在回合结束时立刻补一刀）。
+          log(`[reserved2] ${key} 繁忙期间的主动机会已过期，跳过补发`);
+          continue;
+        } else {
+          log(`[reserved2] ${key} 补发繁忙期间积压的唤醒：${item.reason}`);
+          scheduleWakeV2(key, item.reason);
+        }
+        return { reason: item.reason, action: 'timer' };
       }
-      return { reason: item.reason, action: 'timer' };
+      const stillRelevant = Array.isArray(st.unread) && st.unread.some((m) => m && Number(m.seq) >= Number(item.seq));
+      if (stillRelevant) {
+        log(`[reserved2] ${key} 补发繁忙期间积压的唤醒：${item.reason}@seq${item.seq}`);
+        scheduleWakeV2(key, item.reason);
+        return { reason: item.reason, action: 'replayed' };
+      }
+      log(`[reserved2] ${key} 繁忙期间唤醒 ${item.reason}@seq${item.seq} 已被当前回合处理，跳过补发`);
+      skipped = { reason: item.reason, action: 'skipped' };
     }
-    const stillRelevant = Array.isArray(st.unread) && st.unread.some((m) => m && Number(m.seq) >= Number(item.seq));
-    if (stillRelevant) {
-      log(`[reserved2] ${key} 补发繁忙期间积压的唤醒：${item.reason}@seq${item.seq}`);
-      scheduleWakeV2(key, item.reason);
-      return { reason: item.reason, action: 'replayed' };
-    }
-    log(`[reserved2] ${key} 繁忙期间唤醒 ${item.reason}@seq${item.seq} 已被当前回合处理，跳过补发`);
-    return { reason: item.reason, action: 'skipped' };
+    return skipped;
   }
 
   function setupSleepTimerV2(key) {
