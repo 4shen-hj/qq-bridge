@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+For installation and setup requests, follow [README.ai.md](README.ai.md). This file covers development work.
+
 ## Project structure and module organization
 
 This Node.js bridge connects QQ through SnowLuma OneBot v11 to DeepSeek Harness (DSH).
