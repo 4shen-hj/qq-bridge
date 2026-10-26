@@ -10,7 +10,7 @@
 
 > 请阅读 README.ai.md，按手册帮我安装 qq-bridge。先检查本机环境和已有配置，仅询问缺少的信息。需要我完成 SnowLuma 登录或 QQ 测试时告诉我，最后报告实际验证结果。
 
-AI 会安装桥接依赖、配置 DSH 插件并检查连接。SnowLuma 的安装、启动和扫码登录需要你自行完成。
+AI 会安装桥接依赖、配置 DSH 插件并检查连接。你需要从 [SnowLuma Releases](https://github.com/SnowLuma/SnowLuma/releases) 下载对应平台的完整发行包，解压、启动并完成 QQ 登录；AI 手册会引导你开启 OneBot 接口。
 
 ## 准备环境
 
@@ -31,7 +31,7 @@ npm install
 1. 复制 `config.example.json` 为 `config.json`，已有配置请保留。填写 SnowLuma 地址、令牌和安装目录，以及 `ownerQQ`、`allow.private` 或 `allow.groups`。空白名单默认不接收消息。
 2. 运行 `node scripts/setup-dsh.mjs web` 安装 DSH 预设和 MCP 工具。`web` 要替换为实际使用的 profile，桌面端可能使用 `desktop`。
 3. 重启对应的 DSH 进程，再运行 `npm start`。
-4. 打开 [本地控制台](http://127.0.0.1:3100)，使用 `config.json` 中的 `consoleToken` 登录。未配置时，桥接会自动生成并在启动日志中显示。
+4. 打开 [本地控制台](http://127.0.0.1:3100)，使用有效的 `config.json` 中的 `consoleToken` 登录。未配置或格式不合法时，完整的自动令牌保存在本机 `state/console-token`，启动日志只显示前 6 位。
 5. 检查 DSH、SnowLuma 上游状态和白名单，再从白名单账号发送测试消息，确认 QQ 收到回复。
 
 端口、令牌发现、验收与排错步骤见 [AI 安装手册](README.ai.md)，手动安装也可照着执行。

@@ -6,7 +6,35 @@
 
 在包含 `package.json`、`config.example.json` 和 `src/bridge.js` 的仓库根目录执行命令。先读取 [AGENTS.md](AGENTS.md)、[RULES.md](RULES.md) 和示例配置；已有 `config.json` 时保留并按需修改，不用模板覆盖。
 
-检查 `node --version`、`npm --version` 和 `dsh --version`。Node.js 要求 ≥ 22.13.0。默认部署方式为桥接、DSH、SnowLuma 位于同机且使用同一系统用户。
+检查操作系统、CPU 架构，以及 `node --version`、`npm --version` 和 `dsh --version`。Node.js 要求 ≥ 22.13.0。默认部署方式为桥接、DSH、SnowLuma 位于同机且使用同一系统用户。发行包必须支持目标平台；不要把 Windows 启动命令直接用于 Linux 或 macOS。
+
+### 补齐 Node.js 和 DSH
+
+缺少 Node.js 或 npm 时，从 [Node.js 官网](https://nodejs.org/en/download) 安装满足要求的 LTS 版本，重新打开终端后复验。SnowLuma 完整包自带的 Node.js 不等于终端已经可以运行 `node`、`npm` 或 `dsh`。
+
+DSH 不包含在桥接依赖里。全新环境可按本仓库的适配记录安装以下版本；已有 DSH 时先核对版本，不直接降级或覆盖。
+
+```sh
+npm install -g @deepseek-ai/dsh@0.2.1-rc.2
+dsh --version
+dsh web
+```
+
+按 [DSH 官方说明](https://github.com/deepseek-ai/deepseek-harness)完成首次启动，打开启动日志给出的 Web 地址。让用户在 DSH 设置中配置模型凭据，选择工作区并确认普通会话能收到模型回复，再继续。模型凭据由用户在本机填写，不发到聊天中。仅用 `npx` 启动过 DSH 不代表 `dsh` 已在 PATH；本项目安装脚本需要能直接调用 `dsh`，Windows 下是 `dsh.cmd`。
+
+保留 DSH 终端，另开终端安装桥接。非默认 profile 按实际启动命令记录。其他 DSH 版本按 [DSH 维护](docs/guides/DSH_SETUP.md)验证，不能把“安装了最新版”当作兼容性验证。
+
+### 引导用户下载并配置 SnowLuma
+
+缺少 SnowLuma 时，明确把 [SnowLuma 下载页](https://github.com/SnowLuma/SnowLuma/releases)发给用户，并请用户完成以下步骤。本项目不自动下载、部署、启动 SnowLuma，也不代替用户接受条款或扫码登录。
+
+1. 在 Releases 的 Assets 中下载与系统和 CPU 架构匹配的完整发行包，解压到固定目录。不要下载 `Source code` 当作运行包。仓库已有运行记录对应 [v1.14.20](https://github.com/SnowLuma/SnowLuma/releases/tag/v1.14.20)；其他版本需验证，Lite 版的 Node.js 要求以所选版本说明为准。
+2. 按发行说明准备 QQ 客户端。Windows 运行解压目录中的 `launcher.bat`；Linux 按该版本说明运行 `launcher.sh`。
+3. 打开启动日志中的 WebUI 地址，默认通常为 `http://localhost:5099`。按该版本说明和日志中的初始密码登录，阅读并确认条款，完成密码设置、QQ 进程接入和扫码登录，确认机器人账号在线。
+4. 为该账号启用 OneBot v11 **WebSocket 服务端**和 **HTTP API 服务端**。桥接连接正向 WebSocket，不使用反向 WebSocket 或 HTTP 事件上报。WebUI 的 `5099` 端口不能当作 OneBot API 地址。
+5. 记下实际 HTTP、WS 地址和各自的 accessToken，填入本机配置；令牌不要发到聊天中。保留 SnowLuma 运行，并记录其安装目录用于 `snowluma.homeDir`。不要假定端口总是 `3000`、`3001`，也不要混用 WebUI 登录密码与 OneBot 令牌。
+
+### 确认配置所需信息
 
 从已有配置和运行环境确认下列信息，只询问无法确定的项：
 
@@ -15,7 +43,7 @@
 - SnowLuma 安装目录、QQ 登录状态、OneBot WebSocket 服务端与 HTTP API 地址、各自的令牌。
 - 管理员 QQ 号、允许接入的私聊 QQ 号和群号、期望的运行模式。机器人账号与管理员账号要分清。
 
-DSH 必须完成首次初始化，Web 页面可访问且模型可用。缺少 DSH 时，按其官方安装说明准备环境，再继续。SnowLuma 的下载、安装、启动和扫码登录由用户完成；本项目不自动部署或控制 SnowLuma。
+缺少用户登录或凭据时，明确告知需要用户完成的步骤。可以继续准备桥接依赖和配置模板，但连接验收要等上游就绪。
 
 不要输出完整配置、凭据文件或令牌。不要为排错开放所有 QQ 目标、关闭鉴权，或将安全聊天预设换成完整工具预设。不要清空用户的 `state/`、角色卡或 DSH 配置。
 
@@ -26,6 +54,8 @@ npm install
 ```
 
 保留安装脚本执行权限，`postinstall` 会修补 SnowLuma SDK 的 ESM 导入。若曾跳过脚本，运行 `node scripts/patch-snowluma-sdk.mjs` 补做。
+
+Windows PowerShell 若阻止执行 `npm.ps1`，使用 `npm.cmd`，DSH 同理使用 `dsh.cmd`；不需要修改系统执行策略。安装失败先检查网络、npm 源和报错，不跳过依赖或 `postinstall`。没有额外构建步骤。
 
 仅在 `config.json` 不存在时复制模板。PowerShell：
 
@@ -53,9 +83,11 @@ if [ ! -e config.json ]; then cp config.example.json config.json; fi
 | `snowluma.followDiscoveredEndpoint` | 默认 `true`，自动发现可改写端口配置。明确固定其他端点时设为 `false`，并核对 token 发现目录对应的账号。 |
 | `ownerQQ` | 管理员 QQ 号，不是机器人 QQ 号。 |
 | `allow.private`、`allow.groups` | 用户指定的 QQ 号、群号数组。至少填写测试目标，保持 `allowAllWhenEmpty: false`；`deny` 优先。 |
-| `consolePort`、`consoleToken` | 默认控制台端口 `3100`。令牌留空时启动自动生成。 |
+| `consolePort`、`consoleToken` | 默认端口 `3100`。令牌留空时自动生成并保存在 `state/console-token`；手动设置必须为 16～128 位字母、数字、`_` 或 `-`，不合法时也会回退到自动令牌。 |
 
 `sessionCwd` 留空时使用默认工作目录，不填写作者机器路径。`slang.autoResearch` 默认开启，会将提取的群聊词条交给搜索服务；用户不需要时设为 `false`。
+
+文本聊天不需要 FFmpeg。需要 GIF 抽帧、大图压缩或语音功能时，再安装 FFmpeg 和 ffprobe，使桥接进程的 PATH 可找到它们，或设置 `FFMPEG_PATH`、`FFPROBE_PATH`。语音默认关闭，首次验收无需仓库上级的 `voice-tool/`。
 
 ## 3. 安装 DSH 预设和 MCP 工具
 
@@ -81,7 +113,7 @@ node scripts/setup-dsh.mjs web
 npm start
 ```
 
-同一仓库只运行一个桥接实例。打开 `http://127.0.0.1:<consolePort>`，用本机配置或启动日志中的控制台令牌登录，分享结果时隐藏令牌。
+同一仓库只运行一个桥接实例。打开 `http://127.0.0.1:<consolePort>`，让用户在本机复制有效的 `config.json` 中的 `consoleToken`，或打开 `state/console-token` 复制自动令牌后登录。启动日志只显示令牌前 6 位，不能用于登录；不要把完整令牌输出到聊天中。前台运行用 `Ctrl+C` 停止。
 
 依次检查：
 
@@ -105,6 +137,8 @@ npm run self-test -- http://127.0.0.1:3080
 | 症状 | 先检查 |
 | --- | --- |
 | `dsh` 找不到或安装脚本失败 | CLI 是否在 PATH，profile 是否正确，依赖安装是否完成。修复后重跑 setup。 |
+| setup 报 `EACCES` 或 `EPERM` | 核对报错目录的写入权限和文件占用。AI 沙箱可能禁止创建链接或替换文件，可在有权限的本机终端重跑；不要忽略失败继续验收。 |
+| 控制台令牌无效 | 是否误用了日志中的截断值、SnowLuma 密码或 OneBot token。自动令牌从本机 `state/console-token` 读取。 |
 | DSH 401 | DSH 是否完成初始化，系统用户与 `DSH_HOME` 是否一致，是否误填了旧 `dsh.authToken`。不要打印凭据。 |
 | 缺少 `qq-chat` 或 `qq-chat-v2` | 是否安装到了实际 profile，安装是否成功，是否重启了对应 DSH。 |
 | HTTP 426 | `snowluma.httpUrl` 是否误用了 WebSocket 端口。 |

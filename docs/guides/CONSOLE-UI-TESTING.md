@@ -1,89 +1,38 @@
-# 控制台离线预览与回归测试
+# 控制台预览与测试
 
-这些脚本只读取控制台 HTML，使用内存中的演示数据模拟 API。不会加载项目入口、配置文件、真实 state，也不会连接 QQ 或 DSH。重启、清空、发送消息等按钮只改变内存或返回模拟结果。
+预览和浏览器回归使用模拟 API，不读取生产配置与状态，不连接 QQ 或 DSH。发送、清空、重启等按钮只影响模拟环境。
 
-## 启动预览
+## 预览页面
 
-在项目根目录执行：
+在仓库根目录运行 `npm run preview:console`，打开 `http://127.0.0.1:4173`，按 `Ctrl+C` 停止。需要换端口时运行 `node scripts/console-ui-fixture.mjs --port=4174`。
 
-```sh
-npm run preview:console          # 等价于 node scripts/console-ui-fixture.mjs
-```
+模拟写请求会打印到终端，也可从预览服务的 `/__fixture/requests` 查看。
 
-浏览器访问 `http://127.0.0.1:4173`。写请求会打印到终端，也可以访问 `/__fixture/requests` 查看记录。服务只监听 loopback 地址。按 `Ctrl+C` 退出，演示数据随之丢弃。
+## 运行浏览器回归
 
-可用选项：
+先安装测试依赖，再运行测试：
 
 ```sh
-node scripts/console-ui-fixture.mjs --port=4174
-node scripts/console-ui-fixture.mjs --original --port=4174
-node scripts/console-ui-fixture.mjs --html=path/to/console.html
-```
-
-`--original` 读取 `scripts/fixtures/console.before.html`（改造前的原版，随仓库保留），仅用于对照预览；正常预览读取 `public/console.html`。
-
-## 浏览器回归
-
-```sh
-npm run test:console-ui          # 等价于 node scripts/test-console-ui.mjs
-node scripts/test-console-ui.mjs --artifacts=docs/ui-verification
+npm install --no-save --package-lock=false playwright
+npx playwright install chromium
+npm run test:console-ui
 node scripts/test-preset-console-ui.mjs
 ```
 
-脚本使用 Playwright 和 Chromium。优先使用项目内安装的 `playwright`；Windows 上若未安装 Playwright，会自动改用本机 Chrome / Edge，无需下载浏览器。其他环境可安装 Playwright 及其浏览器，或通过以下环境变量指定：
+Playwright 模块始终必需。已有可用 Chrome 或 Edge 时可复用浏览器，省略 Chromium 下载；检测规则见 [test-console-ui.mjs](../../scripts/test-console-ui.mjs)。自定义模块目录用 `PLAYWRIGHT_MODULE`，浏览器路径用 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`。Linux 缺少系统库时按 Playwright 的安装提示补齐。
 
-- `PLAYWRIGHT_MODULE`：Playwright 模块目录（例如 `npm install --no-save playwright` 后指向 `node_modules/playwright`）。
-- `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`：Chromium / Chrome 可执行文件。
+测试自行启动随机端口的模拟服务，阻止外部浏览器请求，并在结束时关闭服务和浏览器。需要结果和截图时使用 `node scripts/test-console-ui.mjs --artifacts=.audit/console-ui`。
 
-测试自行启动随机端口的 fixture，并在退出时关闭浏览器和服务。浏览器请求被限制到该 fixture 的 origin，外部请求会被阻止并使检查失败。
+## 维护测试预期
 
-覆盖范围：
+新增控制台接口时同步 [console-ui-fixture.mjs](../../scripts/console-ui-fixture.mjs)，否则未知接口会使测试失败。测试覆盖以脚本中的断言为准。
 
-- 改造前 225 个元素 ID 保留，DOM ID 唯一。
-- 十个导航视图及切换后草稿保留，跨越实际的 3 秒状态轮询。
-- 模式及预设、角色创建与切换、静默模式、白名单、安全设置。
-- 二代配置上下两个保存按钮的完整 payload，时间单位、零值、工具开关、暂停及恢复。
-- 一代社交参数与会话阶段。
-- 黑话添加、搜索、标签切换、确认对话框与学习参数。
-- 测试消息、AI 提醒仅发送到 mock API。
-- 核心表单与权限检查的 25 次写请求逐项完整比较，包括请求顺序、方法、路径和嵌套 payload。
-- 用量图表切换时间范围后等待对应数据渲染；受控乱序请求验证旧响应和旧错误不能覆盖当前图表，同范围的慢轮询也能正常显示。
-- 手机 390px 与平板 768px 下十个视图没有页面级横向溢出。
-- 深色模式：切换生效、写入 `localStorage`、刷新后保持、`aria-pressed` 与 `color-scheme` 同步、正文对比度 ≥ 7:1、深色下 390 / 768px 无横向溢出。
-- 未做选择时跟随系统 `prefers-color-scheme`。
-- `prefers-reduced-motion: reduce` 下关闭背景动效、页面切换动画与过渡。
-- 人格管理全流程：新建 → 点列表载入编辑（内容回填、按钮切到「保存修改」）→ 保存修改 → 改名保存（先重命名再保存）→ 删除（确认框自动接受），每步都断言列表随之更新。
-- 仿真提示词：默认可查看且只读、解锁后可编辑、保存后回到只读并提示「需重启 DSH」。
-- 思考强度：档位来自 DSH 公布的能力（low/high/max）、默认 max、可切换保存，并断言页面明示会连带修改 DSH 全局默认。
-- 无 JavaScript 错误、未知 API 或外部网络请求。
+修改 API 时先核对后端契约，再修改预期。不要把当前页面输出直接重录为正确答案。历史基线仅在核实原页面契约后，用 `node scripts/test-console-ui.mjs --original --record-baseline` 更新；该命令不会验证当前新增功能。
 
-新增的控制台 API 都已在 `console-ui-fixture.mjs` 里 mock；**改动控制台时若加了新接口，必须同步补 mock**，否则本套件会在「未知 API」这一项失败。
+## 区分后端与在线测试
 
-`--artifacts` 会保存检查结果 JSON、模拟写请求记录和桌面 / 手机截图（浅色与深色各一组），截图时会静止动画以保证可复现。默认不生成额外文件。
+`npm run test-console` 在隔离环境中测试真实控制台路由，使用模拟网关。`node scripts/test-console-safety.mjs` 检查失败清理与在线测试开关。
 
-## 基线说明
+[test-console.mjs](../../scripts/test-console.mjs) 的 `--live --base <地址>` 配合环境变量 `QQ_CONSOLE_TEST_TOKEN` 连接真实控制台，默认只读。额外启用 `--live-send` 会真实发送消息，必须取得授权并指定 `--kind` 与 `--target`；不会为测试临时扩大白名单。
 
-`console-ui-legacy-ids.json` 保存改造前的 225 个元素 ID。`console-ui-contracts.json` 保留原控制台的 24 次表单写请求，包含二代配置的完整嵌套参数。
-
-当前控制台以这份历史基线为基础，明确补入已经由后端支持的两项变化。安全设置之后新增一次 `POST /api/security`，请求体为 `{ "rehardenStateDir": true }`。上下两个二代保存按钮的 `tools` 对象都包含 `sendVoice: true`，这个值来自离线演示配置，不代表生产默认值。测试对全部 25 次请求做深度相等比较，不删除实际请求或忽略新增字段。后续人格、提示词等交互另有逐步断言。
-
-修改 API 时，先核对后端路由，再调整测试中的预期变化。保留历史基线，避免把当前页面的输出直接录成正确答案。`scripts/fixtures/console.before.html` 保存改造前的原版控制台。以下命令只验证或重录历史基线，不运行当前页面新增功能的测试：
-
-```sh
-node scripts/test-console-ui.mjs --original
-node scripts/test-console-ui.mjs --original --record-baseline
-```
-
-普通浏览器回归不依赖 `console.before.html`。`test-console.mjs` 验证后端 API，不能替代浏览器回归。
-
-此回归验证前端行为和提交契约，不能替代真实 QQ / DSH 集成测试。
-
-## 后端 API 隔离回归
-
-运行 `npm run test-console`。脚本在临时目录内运行真实桥接的控制台路由，网关与 DSH 均为模拟对象，不读取真实 `config.json` 或 `state/`。测试结束或请求失败时，脚本在 `finally` 中恢复配置和角色文件的原始字节及存在性，再删除临时目录。
-
-运行 `node scripts/test-console-safety.mjs` 验证字段缺失、断言失败、网络失败和命令行开关。该脚本的实时模式检查也只连接临时模拟端点。
-
-连接已经运行的真实控制台需要显式提供 `--live --base <控制台地址>`，并设置环境变量 `QQ_CONSOLE_TEST_TOKEN`。此模式只读取角色、会话、挂起项目和名单，不修改配置、角色或会话。
-
-只有再加上 `--live-send --kind group|private --target <明确的QQ号码>`，脚本才调用一次真实发送接口。目标必须已经通过控制台的权限检查，脚本不会临时加入白名单。发送失败会使测试失败，不会把网关不可达算作通过。
+前后端离线回归都不能替代真实 QQ 往返验收。

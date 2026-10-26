@@ -10,7 +10,7 @@ Clone this repository and open it in an AI coding assistant that can read local 
 
 > Read README.ai.md and help me install qq-bridge. Check the environment and existing configuration first. Ask only for missing information. Tell me when I need to log in to SnowLuma or test QQ messaging, and report what you actually verified.
 
-The assistant can install bridge dependencies, configure DSH plugins, and check connections. Install and start SnowLuma yourself, then complete QQ login.
+The assistant can install bridge dependencies, configure DSH plugins, and check connections. Download the full package for your platform from [SnowLuma Releases](https://github.com/SnowLuma/SnowLuma/releases), extract it, start SnowLuma, and complete QQ login yourself. The AI guide explains how to enable the OneBot endpoints.
 
 ## Prepare the environment
 
@@ -31,7 +31,7 @@ npm install
 1. Copy `config.example.json` to `config.json` only if no configuration exists. Set the SnowLuma endpoints, token, and installation directory, plus `ownerQQ` and `allow.private` or `allow.groups`. Empty allowlists reject messages by default.
 2. Run `node scripts/setup-dsh.mjs web`. Replace `web` with the profile your DSH instance uses; desktop installations may use `desktop`.
 3. Restart that DSH instance, then run `npm start`.
-4. Open the [local console](http://127.0.0.1:3100). Sign in with `consoleToken` from `config.json`. If empty, the bridge generates a token and prints it at startup.
+4. Open the [local console](http://127.0.0.1:3100). Sign in with a valid `consoleToken` from `config.json`. If empty or invalid, the bridge uses an automatic token stored locally in `state/console-token`. Startup logs show only its first six characters.
 5. Check DSH, SnowLuma upstream health, and the allowlists. Send a message from an allowed QQ account and confirm that the reply arrives in QQ.
 
 The [AI installation guide](README.ai.md) includes configuration fields, validation steps, and troubleshooting for manual installation too.

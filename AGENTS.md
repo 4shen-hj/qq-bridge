@@ -26,6 +26,10 @@ Run commands from the repository root with Node.js >=22.13.0.
 
 There is no application build step or default `npm test` script.
 
+## Documentation
+
+Keep documentation focused on tasks, permission contracts, and non-obvious tradeoffs. Link to source, configuration, and tests instead of copying defaults, tool lists, API fields, or test inventories. Keep change history in Git. Update `docs/README.md` and incoming links when moving or removing a guide.
+
 ## Coding style and naming conventions
 
 Use ES modules, two-space indentation, semicolons, and single-quoted strings, matching nearby code. Use camelCase for functions and variables, UPPER_SNAKE_CASE for constants, and kebab-case filenames. Name regression scripts `test-*.mjs` and diagnostic probes `probe-*.mjs`. No formatter or linter is configured.
