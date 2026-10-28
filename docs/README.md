@@ -22,5 +22,6 @@
 | 修改权限或处理安全问题 | [安全基线](guides/SECURITY_BASELINE.md) |
 | 发布前检查隐私 | [隐私检查](guides/PRIVACY.md) |
 | 预览和测试控制台 | [控制台测试](guides/CONSOLE-UI-TESTING.md) |
+| 评估下一阶段的官方接入 | [QQ 官方接入规划](QQ_OFFICIAL_INTEGRATION_PLAN.md) |
 
 查可用命令运行 `npm run`，查实现从 [src/](../src/) 和 [plugins/](../plugins/) 开始，查行为断言看 [scripts/](../scripts/) 中对应测试。不要在文档中另存一份接口、常量或测试用例清单。
