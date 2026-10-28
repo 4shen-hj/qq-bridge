@@ -407,7 +407,7 @@ async function cmdSend() {
           loudness: has('loudness') ? String(val('loudness')) : 'normal',
           source: 'cli'
         }),
-        timeoutMs: 240000
+        timeoutMs: 300000
       });
     } catch (error) {
       if (error?.status === 404) {
@@ -417,6 +417,13 @@ async function cmdSend() {
     }
   }
 
+  if (result?.uncertain > 0 || result?.status === 'unknown') {
+    fail('发送结果未确认，请勿自动重试');
+  }
+  if (result?.sent === 0) {
+    console.log(`未发送：${result.reason || '队列已停止'}`);
+    return;
+  }
   console.log(`✅ 已作为语音发出（messageId=${result?.messageId ?? '未知'}${result?.direct ? '，直连模式' : ''}）`);
   if (result?.detail) console.log(`   ${result.detail}`);
   if (result?.audioProcessing && result.audioProcessing !== '原始音量') {

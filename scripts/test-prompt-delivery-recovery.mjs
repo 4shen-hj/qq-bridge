@@ -77,7 +77,7 @@ for (const scenario of ['known-turn', 'first-snapshot-receipt', 'silent', 'tool-
     const events = [start(1), ...(scenario === 'known-turn' ? [] : [receipt(1, id)])];
     if (scenario === 'tool-sent') events.push(
       { type: 'tool/call', data: { turn: 1, callId: 'fixture-call', name: 'mcp__snowluma__qq_send_private_message' } },
-      { type: 'tool/result', data: { turn: 1, message: { source: { callId: 'fixture-call' }, content: [{ type: 'text', text: 'ok' }] } } },
+      { type: 'tool/result', data: { turn: 1, message: { source: { callId: 'fixture-call' }, content: [{ type: 'text', text: '{"ok":true,"sent":1}' }] } } },
     );
     events.push(message(1), end(1));
     if (scenario === 'reset') h.retireSession(key);

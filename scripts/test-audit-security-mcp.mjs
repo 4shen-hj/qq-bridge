@@ -126,10 +126,10 @@ function loadSnowlumaTools(fetchImpl, fixtureConfig = null, httpImpl = null, fix
     SENSITIVE_RE: { test: () => false },
     serializeModelData: (value) => JSON.stringify(value),
   });
-  const callTool = async (name, arguments_ = {}) => {
+  const callTool = async (name, arguments_ = {}, extra) => {
     const tool = tools.get(name);
     assert.ok(tool, `tool ${name} should be registered`);
-    return tool.callback(z.object(tool.schema).parse(arguments_));
+    return tool.callback(z.object(tool.schema).parse(arguments_), extra);
   };
   /** 该模式下某工具是否真的注册进了 schema（注册期收敛的断言入口）。 */
   callTool.has = (name) => tools.has(name);
@@ -273,5 +273,44 @@ test('denied group reads never reveal the group allowlist', async () => {
       assert.equal(callTool.has('qq_get_group_history'), false);
     }
     assert.ok(calls.length >= 1, '应当只经过桥接的鉴权/拒绝路径');
+  }
+});
+
+
+test('all sending tools propagate cancellation and preserve normal cooldown and partial errors', async () => {
+  const sends = [
+    ['qq_send_group_message', { groupId: '456', message: 'hello' }],
+    ['qq_send_private_message', { userId: '123', message: 'hello' }],
+    ['qq_reply', { groupId: '456', message: 'hello', replyToMessageId: '1' }],
+    ['qq_send_burst', { groupId: '456', token: 'fixture', messages: ['hello'] }],
+    ['qq_send_message', { key: 'group:456', token: 'fixture', messages: ['hello'] }],
+    ['qq_send_poke', { key: 'group:456', token: 'fixture', targetUserId: '111' }],
+    ['qq_send_sticker', { key: 'group:456', token: 'fixture', stickerId: 'fixture' }],
+    ['qq_send_voice', { key: 'group:456', token: 'fixture', voice: 'fixture.mp3' }],
+  ];
+  for (const [name, args] of sends) {
+    let observedSignal;
+    const call = loadSnowlumaTools(async (_url, init) => {
+      observedSignal = init.signal;
+      return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true }));
+    }, { socialV2: { tools: { sendVoice: true } } });
+    const controller = new AbortController();
+    const pending = call(name, args, { signal: controller.signal });
+    await new Promise(setImmediate);
+    assert.ok(observedSignal, name);
+    controller.abort();
+    assert.equal((await pending).isError, true, name);
+    assert.equal(observedSignal.aborted, true, name);
+    const failed = loadSnowlumaTools(async () => ({ ok: false, status: 500, json: async () => ({ ok: false, sent: 0, attempted: 1, uncertain: 1, status: 'unknown', error: 'gateway timeout' }) }), { socialV2: { tools: { sendVoice: true } } });
+    const unknown = await failed(name, args);
+    assert.equal(unknown.isError, true, name);
+    assert.equal(JSON.parse(unknown.content[0].text).uncertain, 1, name);
+
+  }
+  for (const [ok, sent, reason] of [[true, 0, 'expired'], [false, 1, 'error']]) {
+    const call = loadSnowlumaTools(async () => ({ ok, status: ok ? 200 : 500, json: async () => ({ ok, sent, reason, error: ok ? undefined : 'gateway unknown' }) }));
+    const result = await call('qq_send_group_message', { groupId: '456', message: 'hello' });
+    assert.equal(result.isError === true, !ok);
+    assert.equal(JSON.parse(result.content[0].text).sent, sent);
   }
 });

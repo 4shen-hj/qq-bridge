@@ -109,7 +109,7 @@ test('terminal errors clear successful-action markers without changing an alread
     const before = clone(st.wakeConfig);
     await emit(f, [started(8),
       { type: 'tool/call', data: { turn: 8, callId: 'sent-call', name: 'mcp__snowluma__qq_send_message', arguments: { messages: ['已发送'] } } },
-      { type: 'tool/result', data: { turn: 8, message: { source: { callId: 'sent-call' }, content: [{ type: 'text', text: 'ok' }] } } },
+      { type: 'tool/result', data: { turn: 8, message: { source: { callId: 'sent-call' }, content: [{ type: 'text', text: '{"ok":true,"sent":1}' }] } } },
       { type: 'tool/call', data: { turn: 8, callId: 'pending-call', name: 'mcp__snowluma__qq_send_message', arguments: {} } },
       ended(8, malformed),
     ]);
@@ -234,11 +234,43 @@ test('completed turns retain close reminders and successful send deduplication',
     await direct.h.sendToQQ(direct.key, '工具已经发出');
     await emit(direct, [started(13),
       { type: 'tool/call', data: { turn: 13, callId: 'send', name: 'mcp__snowluma__qq_send_message', arguments: {} } },
-      { type: 'tool/result', data: { turn: 13, message: { source: { callId: 'send' }, content: [{ type: 'text', text: 'ok' }] } } },
+      { type: 'tool/result', data: { turn: 13, message: { source: { callId: 'send' }, content: [{ type: 'text', text: '{"ok":true,"sent":1}' }] } } },
       assistant(13, '工具已经发出'), ended(13, { kind: 'completed' }),
       started(14), { type: 'assistant/chunk', data: { turn: 14, text: '失败尝试的流式文本' } },
       assistant(14, '恢复后正常回复'), ended(14, { kind: 'completed' }),
     ]);
     assert.deepEqual(direct.h.calls.sent.map(({ text }) => text), ['工具已经发出', '恢复后正常回复']);
   } finally { await direct.h.close(); }
+});
+
+
+test('legacy partial burst still records a successful reply', async () => {
+  const f = await fixture('reserved');
+  try {
+    f.h.cfg.socialV2.send.minSendIntervalMs = 100;
+    f.h.cfg.socialV2.send.queueTtlMs = 40;
+    f.h.cfg.social.burstIntervalMinMs = 100;
+    f.h.cfg.social.burstIntervalMaxMs = 100;
+    await emit(f, [started(20), assistant(20, 'first second third'), ended(20, { kind: 'completed' })]);
+    assert.equal(f.h.calls.sent.length, 1);
+    assert.ok(f.h.social.states.get(f.key).lastAiReplyAt > 0);
+  } finally { await f.h.close(); }
+});
+
+
+for (const mode of ['chat', 'reserved', 'closed-agent']) test(`${mode} does not automatically repeat an uncertain tool attempt`, async () => {
+  const f = await fixture(mode);
+  try {
+    await emit(f, [started(21),
+      { type: 'tool/call', data: { turn: 21, callId: 'unknown', name: 'qq_send_message', arguments: {} } },
+      { type: 'tool/result', data: { turn: 21, message: { source: { callId: 'unknown' }, isError: true, content: [{ type: 'text', text: '{"ok":false,"sent":0,"attempted":1,"uncertain":1,"status":"unknown"}' }] } } },
+      assistant(21, 'possibly delivered'), ended(21, { kind: 'completed' })
+    ]);
+    assert.equal(f.h.calls.sent.length, 0);
+    assert.equal(f.st.lastAiReplyAt, 0);
+    assert.equal(f.h.sendToolSucceededSessions.has(f.sid), false);
+    assert.equal(f.h.sendToolUncertainSessions.has(f.sid), false, 'terminal turn clears uncertainty');
+    await emit(f, [started(22), assistant(22, 'later'), ended(22, { kind: 'completed' })]);
+    assert.equal(f.h.calls.sent.length, 1, 'a genuine later turn remains sendable');
+  } finally { await f.h.close(); }
 });

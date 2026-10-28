@@ -2143,8 +2143,13 @@ button:active:not(:disabled) {
         <input type="number" id="v2LongGapMax" min="0" style="width:80px">
       </div>
       <div class="row">
-        <label style="flex:1">每分钟最多发送</label><input type="number" id="v2MaxSendMin" min="0" style="width:80px">
-        <label style="flex:1">每小时最多发送</label><input type="number" id="v2MaxSendHour" min="0" style="width:80px">
+        <label style="flex:1">账号最小发送间隔（毫秒）</label><input type="number" id="v2MinSendInterval" min="0" style="width:90px">
+        <label style="flex:1">队列消息上限</label><input type="number" id="v2QueueMaxMessages" min="1" style="width:80px">
+        <label style="flex:1">排队有效期（毫秒，最多 120000）</label><input type="number" id="v2QueueTtl" min="1" max="120000" style="width:100px">
+      </div>
+      <div class="row">
+        <label style="flex:1">账号每分钟最多尝试发送</label><input type="number" id="v2MaxSendMin" min="0" style="width:80px">
+        <label style="flex:1">账号每小时最多尝试发送</label><input type="number" id="v2MaxSendHour" min="0" style="width:80px">
       </div>
       <div class="row">
         <label style="flex:1">单条最大字符</label><input type="number" id="v2MaxMsgChars" min="1" style="width:80px">
@@ -2745,7 +2750,8 @@ async function api(path, method, body, _retried = 0) {
   const token = localStorage.getItem('consoleToken');
   const generation = consoleAuth.generation;
   if (token) headers['x-console-token'] = token;
-  const res = await fetch(path, { method: method || 'GET', headers, body: body ? JSON.stringify(body) : undefined });
+  const sending = /^(?:\/api\/test-send|\/api\/voice\/send|\/api\/send\/|\/api\/socialV2\/send-)/.test(path);
+  const res = await fetch(path, { method: method || 'GET', headers, body: body ? JSON.stringify(body) : undefined, ...(sending ? { signal: AbortSignal.timeout(300000) } : {}) });
   if (res.status === 401) {
     if (_retried >= 1) {
       if (generation === consoleAuth.generation && token === localStorage.getItem('consoleToken')) requestConsoleLogin();
@@ -3262,8 +3268,8 @@ document.getElementById('tsSend').addEventListener('click', async () => {
     id: document.getElementById('tsId').value.trim(),
     message: document.getElementById('tsMsg').value
   });
-  document.getElementById('tsMsg2').textContent = r.ok ? ('✅ 已发送 message_id=' + r.message_id) : ('❌ ' + (r.error || '失败'));
-  document.getElementById('tsMsg2').className = r.ok ? 'meta ok' : 'meta err';
+  document.getElementById('tsMsg2').textContent = r.uncertain > 0 || r.status === 'unknown' ? '发送结果未确认，请勿自动重试' : r.sent === 0 ? ('未发送：' + (r.reason || '队列已停止')) : r.ok ? ('✅ 已发送 message_id=' + r.message_id) : ('❌ ' + (r.error || '失败'));
+  document.getElementById('tsMsg2').className = r.uncertain > 0 || r.status === 'unknown' ? 'meta err' : r.sent === 0 ? 'meta' : r.ok ? 'meta ok' : 'meta err';
 });
 document.getElementById('restartBtn').addEventListener('click', async () => {
   if (!confirm('确定重启桥接？')) return;
@@ -3339,6 +3345,12 @@ async function sendVoiceFromConsole() {
     if (r.dryRun) {
       msg.textContent = '✅ 校验通过（未发送）：' + (r.detail || '');
       msg.className = 'meta ok';
+    } else if (r.uncertain > 0 || r.status === 'unknown') {
+      msg.textContent = '发送结果未确认，请勿自动重试';
+      msg.className = 'meta err';
+    } else if (r.sent === 0) {
+      msg.textContent = '未发送：' + (r.reason || '队列已停止');
+      msg.className = 'meta';
     } else if (r.ok) {
       msg.textContent = '✅ 已发出 messageId=' + (r.messageId ?? '?')
         + (r.detail ? '（' + r.detail + '）' : '')
@@ -3394,6 +3406,9 @@ async function loadV2Config() {
     document.getElementById('v2LongGapProb').value = s.longGapProbability ?? 0.2;
     document.getElementById('v2LongGapMin').value = s.longGapMinMs ?? 5000;
     document.getElementById('v2LongGapMax').value = s.longGapMaxMs ?? 10000;
+    document.getElementById('v2MinSendInterval').value = s.minSendIntervalMs ?? 1000;
+    document.getElementById('v2QueueMaxMessages').value = s.queueMaxMessages ?? 100;
+    document.getElementById('v2QueueTtl').value = s.queueTtlMs ?? 120000;
     document.getElementById('v2MaxSendMin').value = s.maxSendPerMinute ?? 8;
     document.getElementById('v2MaxSendHour').value = s.maxSendPerHour ?? 60;
     document.getElementById('v2MaxMsgChars').value = s.maxMessageChars ?? 500;
@@ -3474,6 +3489,9 @@ async function saveV2Config() {
       longGapProbability: Number(document.getElementById('v2LongGapProb').value) || 0,
       longGapMinMs: Math.round(Number(document.getElementById('v2LongGapMin').value) || 5000),
       longGapMaxMs: Math.round(Number(document.getElementById('v2LongGapMax').value) || 10000),
+      minSendIntervalMs: Math.max(0, Math.round(Number(document.getElementById('v2MinSendInterval').value) || 0)),
+      queueMaxMessages: Math.max(1, Math.round(Number(document.getElementById('v2QueueMaxMessages').value) || 100)),
+      queueTtlMs: Math.min(120000, Math.max(1, Math.round(Number(document.getElementById('v2QueueTtl').value) || 120000))),
       maxSendPerMinute: Math.round(Number(document.getElementById('v2MaxSendMin').value) || 0),
       maxSendPerHour: Math.round(Number(document.getElementById('v2MaxSendHour').value) || 0),
       maxMessageChars: Math.round(Number(document.getElementById('v2MaxMsgChars').value) || 500),

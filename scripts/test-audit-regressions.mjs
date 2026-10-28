@@ -98,8 +98,7 @@ await test('R1 无令牌智能体调用：closed-agent 可发送/探测，v2 面
   } finally { await h.close(); }
 });
 
-// ── R2. 分条发送失败：错误必须可读，且预占额度要回滚 ─────────────────────────
-await test('R2 send-burst 失败路径不再抛 ReferenceError，并回滚发送额度', async () => {
+await test('R2 send-burst 失败路径不再抛 ReferenceError，并保留失败尝试额度', async () => {
   const h = await bridgeHarness({
     globals: {
       fetch: async () => ({ ok: false, status: 500, json: async () => ({ status: 'failed', retcode: 100, wording: 'gateway down' }) })
@@ -108,7 +107,8 @@ await test('R2 send-burst 失败路径不再抛 ReferenceError，并回滚发送
   try {
     h.setMode('reserved2');
     const st = h.getSocialV2State('group:456');
-    const before = st.sendTimes.length;
+    const historyPath = path.join(h.temp, 'state/outbound-attempts.json');
+    const before = JSON.parse(fs.readFileSync(historyPath, 'utf8')).attempts.length;
     await withServer(h, async (port) => {
       const res = await call(port, '/api/socialV2/send-burst', {
         method: 'POST', token: st.agentToken, body: { key: 'group:456', messages: ['a', 'b'] }
@@ -117,7 +117,7 @@ await test('R2 send-burst 失败路径不再抛 ReferenceError，并回滚发送
       assert.match(String(res.json?.error ?? ''), /gateway down|OneBot/i, `错误信息应可读，实际：${res.body}`);
       assert.ok(!/st is not defined/.test(String(res.json?.error ?? '')), '不得泄露作用域错误');
     });
-    assert.equal(st.sendTimes.length, before, '失败后预占的发送额度必须回滚（否则接下来一分钟被假 429）');
+    assert.equal(JSON.parse(fs.readFileSync(historyPath, 'utf8')).attempts.length, before + 1, '失败尝试消耗账号额度，批次余下消息不再发送');
   } finally { await h.close(); }
 });
 
@@ -374,7 +374,7 @@ await test('R14 淘汰桶被新基线覆盖后不再重复累加', async () => {
 // `const st/now` 写在 try 内、catch 里使用 ⇒ 任何发送失败都抛 ReferenceError，
 // 于是 ① 模型看到的错误是「st is not defined」而不是网关原因；
 // ② 预占的发送额度不回滚 ⇒ 接下来一分钟全是假 429；③ 部分成功的已发消息不入账。
-await test('R15 /api/send/* 失败路径不抛作用域错误，并回滚发送额度', async () => {
+await test('R15 /api/send/* 失败路径不抛作用域错误，并保留失败尝试额度', async () => {
   const h = await bridgeHarness({
     globals: {
       fetch: async () => ({ ok: false, status: 500, json: async () => ({ status: 'failed', retcode: 100, wording: 'gateway down' }) })
@@ -384,7 +384,8 @@ await test('R15 /api/send/* 失败路径不抛作用域错误，并回滚发送�
     // closed-agent = 管理员私聊通道：这条路径不需要会话令牌（正是旧工具的使用方式）。
     h.setMode('closed-agent');
     const st = h.getSocialV2State('private:123');
-    const before = st.sendTimes.length;
+    const historyPath = path.join(h.temp, 'state/outbound-attempts.json');
+    const before = JSON.parse(fs.readFileSync(historyPath, 'utf8')).attempts.length;
     await withServer(h, async (port) => {
       const res = await call(port, '/api/send/private', {
         method: 'POST', headers: { 'x-agent-call': '1' }, body: { userId: '123', message: '你好' }
@@ -394,7 +395,7 @@ await test('R15 /api/send/* 失败路径不抛作用域错误，并回滚发送�
       assert.match(err, /gateway down|OneBot/i, `错误信息应是网关原因，实际：${res.body}`);
       assert.ok(!/is not defined/.test(err), '不得把作用域错误当成给模型的错误信息');
     });
-    assert.equal(st.sendTimes.length, before, '失败后预占的发送额度必须回滚（否则接下来一分钟被假 429）');
+    assert.equal(JSON.parse(fs.readFileSync(historyPath, 'utf8')).attempts.length, before + 1, '失败尝试消耗账号额度，批次余下消息不再发送');
   } finally { await h.close(); }
 });
 

@@ -152,14 +152,17 @@ function errorText(value, fallback) {
 }
 
 async function agentApi(path, init = {}) {
-  const timeoutMs = init.timeoutMs || 15000;
+  const sending = /^\/api\/(?:send\/|socialV2\/send-)/.test(path);
+  const timeoutMs = sending ? 300000 : init.timeoutMs || 15000;
   const { timeoutMs: _omit, ...rest } = init;
   const headers = agentHeaders(rest.headers);
-  const res = await fetch(`${agentApiBase()}${path}`, { ...rest, headers, signal: AbortSignal.timeout(timeoutMs) });
+  const res = await fetch(`${agentApiBase()}${path}`, { ...rest, headers, signal: rest.signal ? AbortSignal.any([rest.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs) });
   let body = null;
   try { body = await res.json(); } catch { body = null; }
   if (!res.ok) {
-    throw new Error(errorText(body?.error, `桥接 API HTTP ${res.status}`));
+    const error = new Error(errorText(body?.error, `桥接 API HTTP ${res.status}`));
+    error.outbound = body;
+    throw error;
   }
   // 桥接的部分端点会用 200 + {ok:false,error} 表达业务失败（例如发送被审计拦截）。
   // 不检查 body.ok 会把「被拦截」当成「发送成功」上报给模型 —— 模型据此认为消息已发出，
@@ -501,11 +504,12 @@ server.tool(
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('本会话读消息结果的 messageId，非零整数，可负数；不是本地 seq'),
     token: z.string().optional().describe('唤醒提示中的【会话令牌】；reserved2 必填，closed-agent 不需要')
   },
-  async ({ groupId, message, replyToMessageId, token }) => {
+  async ({ groupId, message, replyToMessageId, token }, extra) => {
     try {
       const cleanMessage = unquoteJsonString(message);
       const data = await agentApi('/api/send/group', {
         method: 'POST',
+        signal: extra?.signal,
         // token 既放 body（兼容旧调用）又放 header：桥接的「agent 流量」判定基于 header，
         // 只带 body 会让这条请求在桥接眼里像控制台请求，绕过 agent 专用的闸门与审计。
         ...(token ? { headers: { 'x-agent-token': token } } : {}),
@@ -513,7 +517,7 @@ server.tool(
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
-      return { content: [{ type: 'text', text: `发送失败：${error?.message ?? error}` }], isError: true };
+      return { content: [{ type: 'text', text: error.outbound ? serializeModelData(error.outbound) : `发送失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
@@ -527,17 +531,18 @@ server.tool(
     message: z.string().describe('纯文本，不用 Markdown/CQ 码'),
     token: z.string().optional().describe('唤醒提示中的【会话令牌】；reserved2 必填，closed-agent 不需要')
   },
-  async ({ groupId, replyToMessageId, message, token }) => {
+  async ({ groupId, replyToMessageId, message, token }, extra) => {
     try {
       const cleanMessage = unquoteJsonString(message);
       const data = await agentApi('/api/send/reply', {
         method: 'POST',
+        signal: extra?.signal,
         ...(token ? { headers: { 'x-agent-token': token } } : {}),
         body: JSON.stringify({ groupId: String(groupId), replyToMessageId, message: cleanMessage, token: token || undefined })
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
-      return { content: [{ type: 'text', text: `发送失败：${error?.message ?? error}` }], isError: true };
+      return { content: [{ type: 'text', text: error.outbound ? serializeModelData(error.outbound) : `发送失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
@@ -551,17 +556,18 @@ server.tool(
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('本会话读消息结果的 messageId，非零整数，可负数；不是本地 seq'),
     token: z.string().optional().describe('唤醒提示中的【会话令牌】；reserved2 必填，closed-agent 不需要')
   },
-  async ({ userId, message, replyToMessageId, token }) => {
+  async ({ userId, message, replyToMessageId, token }, extra) => {
     try {
       const cleanMessage = unquoteJsonString(message);
       const data = await agentApi('/api/send/private', {
         method: 'POST',
+        signal: extra?.signal,
         ...(token ? { headers: { 'x-agent-token': token } } : {}),
         body: JSON.stringify({ userId: String(userId), message: cleanMessage, replyToMessageId, token: token || undefined })
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
-      return { content: [{ type: 'text', text: `发送失败：${error?.message ?? error}` }], isError: true };
+      return { content: [{ type: 'text', text: error.outbound ? serializeModelData(error.outbound) : `发送失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
@@ -695,7 +701,7 @@ server.tool(
     token: z.string().describe('唤醒提示中的【会话令牌】'),
     messages: z.union([z.array(z.string()).min(1), z.string()]).describe('纯文本数组，每项发一条；兼容 JSON 数组字符串，不用 Markdown/CQ 码')
   },
-  async ({ groupId, token, messages }) => {
+  async ({ groupId, token, messages }, extra) => {
     try {
       const key = `group:${groupId}`;
       let finalMessages = messages;
@@ -718,13 +724,14 @@ server.tool(
       }
       const data = await agentApi('/api/socialV2/send-burst', {
         method: 'POST',
+        signal: extra?.signal,
         body: JSON.stringify({ key, messages: finalMessages }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
-      return { content: [{ type: 'text', text: `分条发送失败：${error?.message ?? error}` }], isError: true };
+      return { content: [{ type: 'text', text: error.outbound ? serializeModelData(error.outbound) : `分条发送失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
@@ -742,7 +749,7 @@ server.tool(
     gapMs: z.number().optional().describe('fixed 模式下的统一间隔（毫秒）'),
     gaps: z.array(z.number()).optional().describe('fixed 模式下逐条间隔（长度=条数-1）')
   },
-  async ({ key, token, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps }) => {
+  async ({ key, token, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps }, extra) => {
     try {
       let finalMessages = messages;
       if (typeof finalMessages === 'string') {
@@ -764,13 +771,14 @@ server.tool(
       }
       const data = await agentApi('/api/socialV2/send-message', {
         method: 'POST',
+        signal: extra?.signal,
         body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, gapMode, gapMs, gaps }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
-      return { content: [{ type: 'text', text: `发送失败：${error?.message ?? error}` }], isError: true };
+      return { content: [{ type: 'text', text: error.outbound ? serializeModelData(error.outbound) : `发送失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
@@ -784,17 +792,18 @@ if (cfg.socialV2?.tools?.sendPoke !== false) {
       token: z.string().describe('唤醒提示中的【会话令牌】'),
       targetUserId: z.union([z.number(), z.string()]).optional().describe('群聊必填，取活跃成员/消息详情的 userId；私聊省略则拍当前对象')
     },
-    async ({ key, token, targetUserId }) => {
+    async ({ key, token, targetUserId }, extra) => {
       try {
         const data = await agentApi('/api/socialV2/send-poke', {
           method: 'POST',
+          signal: extra?.signal,
           body: JSON.stringify({ key, targetUserId: targetUserId != null ? String(targetUserId) : '' }),
           headers: { 'x-agent-token': token },
-          timeoutMs: 60000
+          timeoutMs: 300000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
-        return { content: [{ type: 'text', text: `拍一拍失败：${error?.message ?? error}` }], isError: true };
+        return { content: [{ type: 'text', text: error.outbound ? serializeModelData(error.outbound) : `拍一拍失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
@@ -1154,17 +1163,18 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('本会话读消息结果的 messageId，非零整数，可负数；不是本地 seq'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号，私聊不可用')
     },
-    async ({ key, token, stickerId, replyToMessageId, atUserId }) => {
+    async ({ key, token, stickerId, replyToMessageId, atUserId }, extra) => {
       try {
         const data = await agentApi('/api/socialV2/send-sticker', {
           method: 'POST',
+          signal: extra?.signal,
           body: JSON.stringify({ key, stickerId: String(stickerId), replyToMessageId, atUserId: atUserId ?? null }),
           headers: { 'x-agent-token': token },
           timeoutMs: 300000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
-        return { content: [{ type: 'text', text: `发送表情失败：${error?.message ?? error}` }], isError: true };
+        return { content: [{ type: 'text', text: error.outbound ? serializeModelData(error.outbound) : `发送表情失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
@@ -1208,10 +1218,11 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
       verify: z.boolean().optional().describe('回读校验语音是否落地，默认 true，建议保持'),
       readback: z.boolean().optional().describe('索取 QQ 转写文本，默认 false；自发语音通常无转写，不应依赖')
     },
-    async ({ key, token, voice, label, verify, readback }) => {
+    async ({ key, token, voice, label, verify, readback }, extra) => {
       try {
         const data = await agentApi('/api/socialV2/send-voice', {
           method: 'POST',
+          signal: extra?.signal,
           body: JSON.stringify({
             key,
             voice: String(voice),
@@ -1225,7 +1236,7 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
-        return { content: [{ type: 'text', text: `发送语音失败：${error?.message ?? error}` }], isError: true };
+        return { content: [{ type: 'text', text: error.outbound ? serializeModelData(error.outbound) : `发送语音失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

@@ -1,6 +1,8 @@
 // Execute the real bridge initialization/functions against temporary files and fake peers.
 // No production config, QQ connection, DSH process, or persistent home is accessed.
 import fs from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createOutboundScheduler, sendResultSucceeded, sendResultUncertain } from '../src/outbound-scheduler.js';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
@@ -37,6 +39,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     dsh: { authToken: 'fixture-only' }, ownerQQ: 123,
     allow: { private: ['123'], groups: ['456'] }, consolePort: 0,
     consoleToken: 'fixture-console-token', slang: { enabled: false }, ...config,
+    socialV2: { ...config.socialV2, send: { maxSendPerMinute: 0, maxSendPerHour: 0, minSendIntervalMs: 0, ...config.socialV2?.send } },
   }));
   if (savedState) fs.writeFileSync(path.join(temp, 'state/sessions.json'), JSON.stringify(savedState));
   // 额外状态文件（用于测试"启动时读到损坏/旧版文件"这类路径）。
@@ -46,8 +49,6 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     fs.writeFileSync(target, typeof content === 'string' ? content : JSON.stringify(content));
   }
   const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], faces: [], http: [] };
-  // 语音发送在桥接里是**直接 fetch 网关**（与文本/表情共用 sendChain，但要自己带 record 段），
-  // 所以这里给 VM 注入一个记录型 fetch：既不让测试真的发 QQ 消息，又能断言发出的段内容。
   const fakeFetch = async (url, init = {}) => {
     const body = (() => { try { return JSON.parse(init.body ?? '{}'); } catch { return init.body; } })();
     calls.http.push({ url: String(url), body });
@@ -149,14 +150,14 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
-    sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
+    outbound, sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
     refreshMode, checkDsh, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2, pumpMux,
     collectors, setupSleepTimerV2,
     pendingWakeKeys, pendingWakeLeaseTimers, wakeConfigUpdatedKeys, markReadCalledKeys,
-    wakeConfigMissCount, sendToolSucceededSessions, pendingSendToolCalls, toolCallNames, social,
+    wakeConfigMissCount, sendToolUncertainSessions, sendToolSucceededSessions, pendingSendToolCalls, toolCallNames, social,
     getInitialPrompt, setInitialPrompt, loadInitialPrompts, formatInitialPromptV2,
     initialPrompts, initialPromptMaxChars,
     extractMediaFromSegments, segmentsToText, fetchOneBotImage, fetchMediaData, resolveMediaList,
@@ -171,7 +172,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     },
     flushQueue, retireSession,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
-    voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
+    voiceSendTimes, voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
     setMode(value) { currentMode = value; },
     setReady(value) { dshReady = value; },
     setPresets(value) { dshPresetIds = value; dshDefaultPreset = 'standard'; },
@@ -180,7 +181,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   bot.onPrivateMessage(async (event) => {`);
   const timers = new Set();
   const context = vm.createContext({
-    fs, os, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
+    fs, os, path, http, crypto, AsyncLocalStorage, createOutboundScheduler, sendResultSucceeded, sendResultUncertain, fileURLToPath, URL, Buffer, AbortSignal, AbortController, console: { log() {}, error() {} },
     fetch: fakeFetch,
     // 锁文件探测用（bridge.js 顶层的 consolePortInUse）；
     // 固定桩掉：测试不应该真去 netstat 宿主机。
@@ -231,6 +232,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   bridge.setPresets(['standard', 'qq-chat', 'qq-chat-v2']);
   bridge.setReady(true);
   return { ...bridge, calls, temp, async close() {
+    bridge.outbound.close();
     for (const timer of timers) clearTimeout(timer);
     fs.rmSync(temp, { recursive: true, force: true });
   } };

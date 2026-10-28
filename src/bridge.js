@@ -6,6 +6,8 @@
 //
 // 用法：node src/bridge.js （先编辑 ../config.json）
 import fs from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createOutboundScheduler, sendResultSucceeded, sendResultUncertain } from './outbound-scheduler.js';
 import { parsePromptSections, wakeVisibleMessages, selectWakeSlang, selectWakeMemory } from './qq-prompt-context.js';
 import os from 'node:os';
 import http from 'node:http';
@@ -503,7 +505,7 @@ function isSilentMarker(text) {
 
 // DSH MCP 发送类工具：一旦 AI 在回合里调用过这些工具，说明消息已经由工具发出，
 // 桥接应跳过该回合的自动转发，避免“工具发一条 + 自动转发一条”的重复。
-const SEND_TOOL_RE = /^mcp__snowluma__qq_(send_group_message|send_private_message|reply|send_burst|send_message)$/;
+const SEND_TOOL_RE = /^(?:mcp__snowluma__)?qq_(send_group_message|send_private_message|reply|send_burst|send_message|send_sticker|send_voice|send_poke)$/;
 function isSendToolName(name) {
   return SEND_TOOL_RE.test(String(name ?? ''));
 }
@@ -816,6 +818,9 @@ function loadConfig() {
         longGapMaxMs: 10000,
         maxSendPerMinute: 8,
         maxSendPerHour: 60,
+        minSendIntervalMs: Math.max(1000, Number(file.sendDelayMs) || 0),
+        queueMaxMessages: 100,
+        queueTtlMs: 120000,
         maxMessageChars: 500,
         maxGapMs: 10000,
         gapBaseMs: 800,
@@ -874,6 +879,13 @@ function loadConfig() {
       },
       ...(file.socialV2 ?? {})
     }
+  };
+
+  cfg.socialV2.send = {
+    maxSendPerMinute: 8, maxSendPerHour: 60,
+    minSendIntervalMs: Math.max(1000, Number(file.sendDelayMs) || 0),
+    queueMaxMessages: 100, queueTtlMs: 120000,
+    ...cfg.socialV2.send
   };
 
   // socialV2.tools 需要与默认值深度合并：旧 config.json 若缺少新增工具开关，
@@ -1702,21 +1714,18 @@ async function main() {
     throw new Error(`找不到音频「${raw}」${fuzzy}`);
   }
 
-  /**
-   * 语音发送限流：与文本发送分开计数，避免语音吃掉聊天额度（也避免聊天把语音额度耗光）。
-   *
-   * 在途预占也计入额度，失败释放，成功后转成发送时间。
-   */
   function voiceBudgetCheck(scopeKey, cfgV) {
     const now = Date.now();
     const bucket = voiceSendTimes.get(scopeKey) ?? [];
-    const inMinute = bucket.filter((t) => typeof t === 'object' || now - t < 60000);
-    const inHour = bucket.filter((t) => typeof t === 'object' || now - t < 3600000);
-    if (cfgV.maxPerMinute > 0 && inMinute.length + 1 > cfgV.maxPerMinute) {
-      throw new Error(`语音发送频率超限（每分钟最多 ${cfgV.maxPerMinute} 条），请稍后再试`);
+    let retryAfterMs = 0;
+    for (const [limit, window] of [[cfgV.maxPerMinute, 60000], [cfgV.maxPerHour, 3600000]]) {
+      const recent = bucket.map((t) => typeof t === 'object' ? now : t).filter((t) => now - t < window).sort((a, b) => a - b);
+      if (limit > 0 && recent.length >= limit) retryAfterMs = Math.max(retryAfterMs, recent[recent.length - limit] + window - now);
     }
-    if (cfgV.maxPerHour > 0 && inHour.length + 1 > cfgV.maxPerHour) {
-      throw new Error(`语音发送频率超限（每小时最多 ${cfgV.maxPerHour} 条），请稍后再试`);
+    if (retryAfterMs > 0) {
+      const context = outboundContext.getStore();
+      if (context) context.outbound = { status: 'not-sent', sent: 0, attempted: 0, unsent: 1, reason: 'voice-cooldown', retryAfterMs };
+      throw new Error('语音发送频率超限，请稍后再试');
     }
   }
 
@@ -1778,39 +1787,30 @@ async function main() {
       assertSendAllowed?.();
       const [kind, id] = key.split(':');
       const recordSegment = { type: 'record', data: { file: sendPath } };
-      let resolveSend;
-      let rejectSend;
-      const sendPromise = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
-      sendChain = sendChain.then(async () => {
-        try {
-          if (assertSendAllowed) assertSendAllowed();
-          // 语音条比图片大、要过一次 SILK 转码，给 60s 预算（文本/图片共用同一 sendChain，
-          // 所以这条语音发完之前后面的文本会自然排队，不会插队到语音前面）。
-          const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-          const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
-          const params = kind === 'private'
-            ? { user_id: Number(id), message: [recordSegment] }
-            : { group_id: Number(id), message: [recordSegment] };
-          const res = await fetch(`${httpUrl}/${action}`, {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-            },
-            body: JSON.stringify(params),
-            signal: AbortSignal.timeout(60000)
-          });
-          const body = await res.json().catch(() => ({}));
-          if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
-            const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口）' : '';
-            throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
-          }
-          resolveSend(body.data);
-        } catch (error) {
-          rejectSend(error);
-        }
+      const [data] = await submitOutbound(key, [{ transport: async () => {
+      const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+      const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+      const params = kind === 'private'
+        ? { user_id: Number(id), message: [recordSegment] }
+        : { group_id: Number(id), message: [recordSegment] };
+      const res = await fetch(`${httpUrl}/${action}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+        },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(60000)
       });
-      const data = await sendPromise;
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+        const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口）' : '';
+        throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
+      }
+      return body.data;
+      } }], assertSendAllowed ?? (() => {
+        if (!allowed(kind, Number(id), cfg)) throw new Error('发送已取消：目标不在白名单');
+      }));
       return {
         messageId: data?.message_id ?? null,
         bytes: info.size,
@@ -1987,18 +1987,7 @@ async function main() {
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-    // 与文本发送共用 sendChain，保证“先文字后表情”的真人顺序不被并发工具调用打乱。
-    let sendResolve;
-    let sendReject;
-    const sendResult = new Promise((resolve, reject) => {
-      sendResolve = resolve;
-      sendReject = reject;
-    });
-    sendChain = sendChain.then(async () => {
-      try {
-        // 真人发表情前通常会有短暂停顿，避免“文字刚发完表情立刻跟上”的机械感。
-        await sleep(randInt(800, 2000));
-        assertSendAllowed();
+    const [data] = await submitOutbound(key, [{ transport: async () => {
         const res = await fetch(`${httpUrl}/${action}`, {
           method: 'POST',
           headers: {
@@ -2013,12 +2002,8 @@ async function main() {
           const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）' : '';
           throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
         }
-        sendResolve(body.data);
-      } catch (error) {
-        sendReject(error);
-      }
-    });
-    const data = await sendResult;
+        return body.data;
+    } }], assertSendAllowed);
     // 更新本地使用统计
     const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
     stickerEntries = updated.entries;
@@ -2436,6 +2421,7 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   state.delivery ??= {};
   const delivery = createPromptDelivery(state.delivery, saveState);
+  const sendToolUncertainSessions = new Set();
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
@@ -2746,11 +2732,9 @@ async function main() {
    * 为什么单独抽出来：这些 Map/Set 分散在文件各处，退役路径（retireSession）、
    * 手动重置（/api/session/reset、/reset、workspace reset）、二代状态重置
    * 各自只清了其中一部分 —— 于是「哪个 key 清哪个不清」完全靠人记。
-   * 结果是有界但真实的慢性泄漏：被移出白名单的会话，其 lastSendFailed、
-   * 限流时间戳会一直留在内存里。所有撤销会话映射的路径都必须调用这里。
+   * 结果是有界但真实的慢性泄漏：被移出白名单的会话，其限流时间戳会一直留在内存里。所有撤销会话映射的路径都必须调用这里。
    */
   function forgetConversationCaches(key) {
-    lastSendFailed.delete(key);
     activeWaits.delete(key);
     queuedHintAt.delete(key);
     slangSubmitTimes.delete(key);
@@ -2774,6 +2758,7 @@ async function main() {
     sessionModels.delete(sessionId);
     modelAppliedSessions.delete(sessionId);
     sendToolSucceededSessions.delete(sessionId);
+    sendToolUncertainSessions.delete(sessionId);
     pendingSendToolCalls.delete(sessionId);
     v2TurnStartAt.delete(sessionId);
     turnLeaseNoted.delete(sessionId);
@@ -3250,7 +3235,7 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
-    const server = http.createServer(async (req, res) => {
+    const handleRequest = async (req, res, requestContext) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
       catch {
@@ -3258,6 +3243,12 @@ async function main() {
         res.end(JSON.stringify({ ok: false, error: '无效的请求地址' }));
         return;
       }
+      requestContext.tool = requestContext.token ? ({
+        '/api/socialV2/send-message': 'sendMessage', '/api/socialV2/send-burst': 'sendBurst',
+        '/api/socialV2/send-poke': 'sendPoke', '/api/socialV2/send-sticker': 'sendSticker',
+        '/api/socialV2/send-voice': 'sendVoice', '/api/send/group': 'sendGroup',
+        '/api/send/private': 'sendPrivate', '/api/send/reply': 'reply'
+      })[url.pathname] : null;
       const SECURITY_HEADERS = {
         'X-Frame-Options': 'DENY',
         'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
@@ -3266,6 +3257,16 @@ async function main() {
         'Referrer-Policy': 'no-referrer'
       };
       const sendJson = (obj, status = 200) => {
+        if (requestContext.outbound) {
+          const { results, ...result } = requestContext.outbound;
+          obj = { ...obj, ...result };
+          if (result.reason && result.reason !== 'error') {
+            obj.ok = true;
+            delete obj.error;
+            status = 200;
+          }
+        }
+        if (res.destroyed) return;
         res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...SECURITY_HEADERS });
         res.end(JSON.stringify(obj, null, 2));
       };
@@ -3321,7 +3322,7 @@ async function main() {
         });
         // 请求体超限/连接异常时也要结束等待，避免 handler 悬挂
         req.on('error', () => fail(400, '请求体读取失败'));
-        req.on('aborted', () => fail(400, '请求体读取中断'));
+        req.on?.('aborted', () => fail(400, '请求体读取中断'));
       });
       // 浏览器会自动请求 /favicon.ico，且**不带控制台令牌**。若让它落到下面的鉴权分支，
       // 每次打开控制台都会在 DevTools 里留一条 401 噪音（离线预览 fixture 早已用 204 处理，
@@ -4323,9 +4324,9 @@ async function main() {
           if (!modeAllowed(`${kind}:${id}`, kind, id, cfg, currentMode)) { sendJson({ ok: false, error: `当前模式（${currentMode}）不允许向 ${kind}:${id} 发送测试消息` }, 403); return; }
           try {
             const safeMessage = escapeCqText(redactKnownTokensOnly(message));
-            const result = kind === 'private'
-              ? await bot.sendPrivateMessage(id, text(safeMessage))
-              : await bot.sendGroupMessage(id, text(safeMessage));
+            const [result] = await submitOutbound(`${kind}:${id}`, [{ transport: () => withTimeout(kind === 'private'
+              ? bot.sendPrivateMessage(id, text(safeMessage))
+              : bot.sendGroupMessage(id, text(safeMessage)), SEND_TIMEOUT_MS, 'QQ 测试发送') }], captureSendGuard(`${kind}:${id}`, { ai: false }));
             log(`控制台：测试发送 ${kind}:${id} 成功`);
             sendJson({ ok: true, kind, id, message_id: result?.message_id ?? result });
           } catch (error) {
@@ -4547,7 +4548,7 @@ async function main() {
           // send：数值归一化
           if (body.send && typeof body.send === 'object') {
             merged.send = { ...(current.send ?? {}), ...body.send };
-            for (const k of ['burstMaxMessages', 'burstIntervalMinMs', 'burstIntervalMaxMs', 'longGapProbability', 'longGapMinMs', 'longGapMaxMs', 'maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars', 'maxGapMs', 'gapBaseMs', 'gapPerCharMs']) {
+            for (const k of ['burstMaxMessages', 'burstIntervalMinMs', 'burstIntervalMaxMs', 'longGapProbability', 'longGapMinMs', 'longGapMaxMs', 'maxSendPerMinute', 'maxSendPerHour', 'minSendIntervalMs', 'queueMaxMessages', 'queueTtlMs', 'maxMessageChars', 'maxGapMs', 'gapBaseMs', 'gapPerCharMs']) {
               if (merged.send[k] !== undefined) {
                 const n = Number(merged.send[k]);
                 merged.send[k] = Number.isFinite(n) ? n : current.send?.[k] ?? 0;
@@ -4634,6 +4635,10 @@ async function main() {
           if (merged.enabled !== undefined) merged.enabled = merged.enabled === true;
           if (merged.provideRecommendations !== undefined) merged.provideRecommendations = merged.provideRecommendations === true;
           if (merged.agentPreset !== undefined) merged.agentPreset = String(merged.agentPreset ?? '');
+          if (merged.send) {
+            merged.send.queueTtlMs = Math.min(120000, Math.max(1, Number(merged.send.queueTtlMs) || 120000));
+            merged.send.queueMaxMessages = Math.max(1, Math.floor(Number(merged.send.queueMaxMessages) || 100));
+          }
           file.socialV2 = merged;
           atomicWriteJson(configFile, file);
           cfg.socialV2 = { ...(cfg.socialV2 ?? {}), ...merged };
@@ -4697,6 +4702,7 @@ async function main() {
               toolCallNames.delete(sid);
               pendingSendToolCalls.delete(sid);
               sendToolSucceededSessions.delete(sid);
+              sendToolUncertainSessions.delete(sid);
               // 订阅也要退掉，否则它会在每次重连时被重新 follow 并重发整份快照。
               api.events.forget?.(sid);
             }
@@ -5247,27 +5253,11 @@ async function main() {
           const st = getSocialV2State(key);
           const now = Date.now();
           try {
-            const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
-            const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + messages.length > maxPerMinute) || (maxPerHour > 0 && recentHour + messages.length > maxPerHour)) {
-              sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
-              return;
-            }
-            // 先预占发送额度，避免并发绕过限频
-            for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const delays = computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
             const sentMessages = await sendMessagesV2(key, messages, delays);
             recordSentMessagesV2(key, sentMessages);
-            st.lastAiReplyAt = now;
-            st.lastActionAt = now;
-            st.wakeConfig.noActionCount = 0;
-            saveSocialV2State();
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
-            if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
             const spaceWarn = findCjkSpaceWarning(messages);
             const splitWarn = findSplitBoundaryWarning(messages);
@@ -5277,14 +5267,6 @@ async function main() {
               recordSentMessagesV2(key, error.sent);
               log(`[reserved2] 工具分条发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
-            // 失败/未发出的消息回滚预占的发送额度，避免假 429。
-            const sentCount = Array.isArray(error?.sent) ? error.sent.length : 0;
-            const failedCount = Math.max(0, messages.length - sentCount);
-            for (let i = 0; i < failedCount; i++) {
-              const idx = st.sendTimes.indexOf(now);
-              if (idx >= 0) st.sendTimes.splice(idx, 1);
-            }
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
@@ -5376,30 +5358,13 @@ async function main() {
             }
           }
           const delays = computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg);
-          // 先做发送频率检查并预占额度，再解析引用目标，避免未限流的引用查询打爆 OneBot。
           const st = getSocialV2State(key);
           const now = Date.now();
-          const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
-          const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-          const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-          const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-          if ((maxPerMinute > 0 && recentMinute + messages.length > maxPerMinute) || (maxPerHour > 0 && recentHour + messages.length > maxPerHour)) {
-            sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
-            return;
-          }
-          // 先预占发送额度，避免并发绕过限频
-          for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
-          if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
           let quotedInfo = null;
           let actualReplyToMessageId = replyToMessageId;
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
             const resolved = await resolveReplyTargetV2(st, kind, id, String(replyToMessageId).trim());
             if (!resolved) {
-              // 引用解析失败：回滚已预占的发送额度
-              for (let i = 0; i < messages.length; i++) {
-                const idx = st.sendTimes.indexOf(now);
-                if (idx >= 0) st.sendTimes.splice(idx, 1);
-              }
               saveSocialV2State();
               sendJson({ ok: false, error: '无法解析被引用消息，请确认 message id 正确且属于当前会话（可用 qq_get_message_detail 查看）' }, 400);
               return;
@@ -5410,13 +5375,8 @@ async function main() {
           try {
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages);
-            st.lastAiReplyAt = now;
-            st.lastActionAt = now;
-            st.wakeConfig.noActionCount = 0;
-            saveSocialV2State();
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
-            if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
             const spaceWarn = findCjkSpaceWarning(messages);
             const splitWarn = findSplitBoundaryWarning(messages);
@@ -5426,14 +5386,6 @@ async function main() {
               recordSentMessagesV2(key, error.sent);
               log(`[reserved2] 工具统一发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
-            // 失败/未发出的消息回滚预占的发送额度，避免假 429。
-            const sentCount = Array.isArray(error?.sent) ? error.sent.length : 0;
-            const failedCount = Math.max(0, messages.length - sentCount);
-            for (let i = 0; i < failedCount; i++) {
-              const idx = st.sendTimes.indexOf(now);
-              if (idx >= 0) st.sendTimes.splice(idx, 1);
-            }
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
@@ -5475,16 +5427,6 @@ async function main() {
           const st = getSocialV2State(key);
           const sendCfg = cfg.socialV2?.send ?? {};
           const now = Date.now();
-          const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
-          const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-          const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-          const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-          if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
-            sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
-            return;
-          }
-          st.sendTimes.push(now);
-          if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
           // 成员校验是异步的（要问 OneBot）；期间操作者可能切模式/改白名单/开静默。
           // 拍一拍此前完全没有发送守卫，这里补上：真正发之前再确认一次。
           const sendGuard = captureSendGuard(key);
@@ -5495,14 +5437,11 @@ async function main() {
               blocked.statusCode = 403;
               throw blocked;
             }
-            if (kind === 'group') {
-              await bot.raw('group_poke', { group_id: id, user_id: Number(targetUserId) });
-            } else {
-              // 私聊拍一拍：send_poke 自动路由到当前私聊对象
-              await bot.raw('send_poke', { user_id: id });
-            }
-            st.lastActionAt = now;
-            st.lastAiReplyAt = now;
+            await submitOutbound(key, [{ transport: () => withTimeout(kind === 'group'
+              ? bot.raw('group_poke', { group_id: id, user_id: Number(targetUserId) })
+              : bot.raw('send_poke', { user_id: id }), SEND_TIMEOUT_MS, 'QQ 拍一拍') }], sendGuard);
+            st.lastActionAt = Date.now();
+            st.lastAiReplyAt = Date.now();
             st.wakeConfig.noActionCount = 0;
             const pokeText = kind === 'group'
               ? `[拍一拍] 我拍了拍 ${targetUserId}`
@@ -5535,10 +5474,7 @@ async function main() {
             appendActivity(`${key} [reserved2] 工具拍一拍${kind === 'group' ? ' -> ' + targetUserId : ''}`);
             sendJson({ ok: true, key, kind, targetUserId: targetUserId || String(id) });
           } catch (error) {
-            const idx = st.sendTimes.indexOf(now);
-            if (idx >= 0) st.sendTimes.splice(idx, 1);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
-            log(`[reserved2] 工具拍一拍失败 ${key}:`, error?.message ?? error);
+            if (!requestContext.outbound?.reason || requestContext.outbound.reason === 'error') log(`[reserved2] 工具拍一拍失败 ${key}:`, error?.message ?? error);
             sendJson({ ok: false, error: `拍一拍失败：${error?.message ?? error}` }, error?.statusCode ?? 500);
           }
           return;
@@ -5879,16 +5815,6 @@ async function main() {
           const now = Date.now();
           try {
             const st = getSocialV2State(key);
-            const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
-            const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
-              sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
-              return;
-            }
-            st.sendTimes.push(now);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const sent = await sendStickerV2(key, stickerId, {
               replyToMessageId: actualReplyToMessageId,
               atUserId
@@ -5914,8 +5840,8 @@ async function main() {
             });
             const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
             if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
-            st.lastAiReplyAt = now;
-            st.lastActionAt = now;
+            st.lastAiReplyAt = Date.now();
+            st.lastActionAt = Date.now();
             st.wakeConfig.noActionCount = 0;
             st.preSleepWaitSatisfiedAt = 0;
             st.preSleepWaitObservedAt = 0;
@@ -5927,11 +5853,8 @@ async function main() {
             sendJson({ ok: true, key, sticker: sent.entry, sent: 1, failed: 0, quoted: quotedInfo });
           } catch (error) {
             const st = getSocialV2State(key);
-            const idx = st.sendTimes.indexOf(now);
-            if (idx >= 0) st.sendTimes.splice(idx, 1);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             saveSocialV2State();
-            log(`[sticker] 工具发送表情失败 ${key}: ${error?.message ?? error}`);
+            if (!requestContext.outbound?.reason || requestContext.outbound.reason === 'error') log(`[sticker] 工具发送表情失败 ${key}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `发送表情失败：${error?.message ?? error}` }, 500);
           }
           return;
@@ -6167,7 +6090,7 @@ async function main() {
           req.on('close', finishWait);
           // 响应关闭也兜底清租约：handler 中途抛错时由外层 catch 回一个 JSON，
           // 那条路径不会经过下面的 finishWait()，会留下 15 分钟的假 429。
-          res.on('close', finishWait);
+          res.on?.('close', finishWait);
           const minQuietAfterNewMs = Number.isFinite(Number(waitCfg.minQuietAfterNewMs)) ? Math.max(0, Number(waitCfg.minQuietAfterNewMs)) : 10000;
           const suggestedQuietMs = Math.max(suggestQuietMsV2(st), minQuietAfterNewMs);
           const rawQuietMs = body.quietMs != null ? Number(body.quietMs) : suggestedQuietMs;
@@ -7099,47 +7022,19 @@ async function main() {
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
           if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
           if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
-          // st/now 必须声明在 try **之外**：下面的 catch 要用它们回滚预占的发送额度。
-          // 写在 try 里时 catch 拿到的是块作用域外的名字 ⇒ ReferenceError（send-burst
-          // 曾整段踩过同型问题，见体检报告 #1 / R2）。后果不是"少一行日志"，而是
-          // 失败响应变成「st is not defined」、额度不回滚（接下来一分钟全是假 429），
-          // 且部分成功的已发消息不会被记进 recentMessages。
           const st = getSocialV2State(key);
           const now = Date.now();
           try {
-            const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
-            const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
-              sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
-              return;
-            }
-            st.sendTimes.push(now);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages);
-            st.lastAiReplyAt = now;
-            st.lastActionAt = now;
-            st.wakeConfig.noActionCount = 0;
-            saveSocialV2State();
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
-            if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
               log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
             }
-            // 失败/未发出的消息回滚预占的发送额度，避免假 429。
-            const sentCount = Array.isArray(error?.sent) ? error.sent.length : 0;
-            const failedCount = Math.max(0, 1 - sentCount);
-            for (let i = 0; i < failedCount; i++) {
-              const idx = st.sendTimes.indexOf(now);
-              if (idx >= 0) st.sendTimes.splice(idx, 1);
-            }
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
@@ -7159,6 +7054,7 @@ async function main() {
           reverse.delete(oldSessionId);
           collectors.delete(oldSessionId);
           sendToolSucceededSessions.delete(oldSessionId);
+          sendToolUncertainSessions.delete(oldSessionId);
           pendingSendToolCalls.delete(oldSessionId);
           v2TurnStartAt.delete(oldSessionId);
           turnLeaseNoted.delete(oldSessionId);
@@ -7273,6 +7169,7 @@ async function main() {
             reverse.clear();
             collectors.clear();
             sendToolSucceededSessions.clear();
+            sendToolUncertainSessions.clear();
             pendingSendToolCalls.clear();
             v2TurnStartAt.clear();
             toolCallNames.clear();
@@ -7304,6 +7201,16 @@ async function main() {
         const status = Number(error?.statusCode) || 500;
         sendJson({ ok: false, error: error?.message ?? String(error) }, status);
       }
+    };
+    const server = http.createServer((req, res) => {
+      const controller = new AbortController();
+      res.on?.('close', () => { if (!res.writableEnded) controller.abort(); });
+      req.on?.('aborted', () => controller.abort());
+      const requestContext = {
+        signal: controller.signal, token: req.headers['x-agent-token'],
+        checkToken: (key) => agentTokenOk(key, req.headers['x-agent-token'])
+      };
+      return outboundContext.run(requestContext, () => handleRequest(req, res, requestContext));
     });
     server.listen(port, '127.0.0.1', () => {
       log(`本地控制台已启动：http://127.0.0.1:${port}`);
@@ -7328,7 +7235,38 @@ async function main() {
   const pending = new Map(); // key -> { kind, rpcId, sessionId, ... }
 
   // QQ 发送队列（顺序发送 + 间隔，避免触发频率限制）
-  let sendChain = Promise.resolve();
+  const outboundContext = new AsyncLocalStorage();
+  const outbound = createOutboundScheduler({
+    historyFile: path.join(STATE_DIR, 'outbound-attempts.json'), legacyFile: SOCIAL_V2_FILE,
+    policy: () => cfg.socialV2.send
+  });
+
+  async function submitOutbound(key, items, assertAllowed = captureSendGuard(key)) {
+    const context = outboundContext.getStore();
+    const guard = () => {
+      assertAllowed?.();
+      if (context?.token && !context.checkToken(key)) throw new Error('发送已取消：agent token 已失效');
+      if (context?.tool && !v2ToolEnabled(context.tool)) throw new Error('发送已取消：工具已关闭');
+      if (context?.tool === 'sendVoice' && !voiceCfg().enabled) throw new Error('发送已取消：语音已关闭');
+      if (context?.tool === 'sendSticker' && !stickerEnabled()) throw new Error('发送已取消：表情已关闭');
+    };
+    let result;
+    try {
+      result = await outbound.send({ key, items, assertAllowed: guard, signal: context?.signal });
+    } catch (error) {
+      if (context && error.outbound) context.outbound = error.outbound;
+      error.sent = (error.outbound?.results ?? []).map((r) => r.value);
+      throw error;
+    }
+    if (context) context.outbound = result;
+    if (result.status !== 'sent') {
+      const error = new Error(`发送队列已停止：${result.reason}`);
+      error.sent = result.results.map((r) => r.value);
+      error.outbound = result;
+      throw error;
+    }
+    return result.results.map((r) => r.value);
+  }
   function redactKnownTokensOnly(text) {
     let s = String(text ?? '');
     for (const token of KNOWN_AGENT_TOKENS) {
@@ -7337,36 +7275,19 @@ async function main() {
     return s;
   }
 
-  // 最近一次发送是否全部成功（按 key）。调用方据此决定要不要刷新「我发过言了」的时间戳 ——
-  // 旧实现把发送失败吞成一行日志后**照常 resolve**，于是调用方以为发言成功，
-  // 更新 lastAiReplyAt / 活跃调度，实际群里什么都没收到，而且只有一行滚动日志能看出问题。
-  const lastSendFailed = new Map(); // key -> true（下一次成功即清除）
-
-  function sendToQQ(key, msg) {
-    const assertSendAllowed = captureSendGuard(key);
-    const safeMsg = redactKnownTokensOnly(msg);
+  async function sendToQQ(key, msg, { ai = false } = {}) {
     const [kind, id] = key.split(':');
-    const parts = splitForQQ(safeMsg);
-    lastSendFailed.delete(key);
-    for (const part of parts) {
-      sendChain = sendChain
-        .then(async () => {
-          assertSendAllowed();
-          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
-          else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
-        })
-        .catch((error) => {
-          lastSendFailed.set(key, true);
-          log(`QQ 发送失败 (${key}):`, error?.message ?? error);
-        })
-        .then(() => sleep(cfg.sendDelayMs));
+    const items = splitForQQ(redactKnownTokensOnly(msg)).map((part) => ({
+      transport: async () => {
+        await withTimeout(kind === 'private' ? bot.sendPrivateMessage(Number(id), text(escapeCqText(part))) : bot.sendGroupMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${key}`);
+        return part;
+      }
+    }));
+    try { return await submitOutbound(key, items, captureSendGuard(key, { ai })); }
+    catch (error) {
+      log(`QQ 发送停止 (${key}):`, error?.message ?? error);
+      return error.sent ?? [];
     }
-    return sendChain;
-  }
-
-  /** 上一批发往该会话的消息是否全部成功。 */
-  function lastSendSucceeded(key) {
-    return lastSendFailed.get(key) !== true;
   }
 
   // ── 真人式分条发送 ──────────────────────────────────────────────────────
@@ -7519,8 +7440,6 @@ async function main() {
     return { main: main.filter(Boolean), followUp: null };
   }
 
-  // 分条发送：与 sendToQQ 共用同一 sendChain，严格顺序；条间随机间隔，
-  // 有概率使用长间隔（错落感）；最后一条后不再 sleep。
   function sendBurstToQQ(key, messages, socialCfgOrMin, maybeMax) {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
@@ -7537,31 +7456,20 @@ async function main() {
       max = Math.max(min, Number(maybeMax) || min);
     }
 
-    const sent = [];
-    for (let i = 0; i < messages.length; i++) {
-      const msg = redactKnownTokensOnly(messages[i]);
-      const isLast = i === messages.length - 1;
-      sendChain = sendChain
-        .then(async () => {
-          assertSendAllowed();
-          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
-          else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
-          sent.push(msg);
-        })
-        .catch((error) => {
-          log(`QQ 发送失败 (${key}):`, error?.message ?? error);
-          // 与 sendToQQ 同样的失败记账。少了这一步，调用方 `lastSendSucceeded(key)`
-          // 会把「一条都没发出去」当成「我已经说过话了」：刷新 lastActiveMessageAt /
-          // lastAiReplyAt 并抑制后续接话，而群里什么都没收到 —— 静默丢回复。
-          lastSendFailed.set(key, true);
-        });
-      if (!isLast) {
-        const useLong = longProb > 0 && Math.random() < longProb;
-        const delay = useLong ? randInt(longMin, longMax) : randInt(min, max);
-        sendChain = sendChain.then(() => sleep(delay));
-      }
-    }
-    return sendChain.then(() => sent);
+    const items = messages.map((message) => {
+      const msg = redactKnownTokensOnly(message);
+      return {
+        delayAfterMs: longProb > 0 && Math.random() < longProb ? randInt(longMin, longMax) : randInt(min, max),
+        transport: async () => {
+          await withTimeout(kind === 'private' ? bot.sendPrivateMessage(Number(id), text(escapeCqText(msg))) : bot.sendGroupMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${key}`);
+          return msg;
+        }
+      };
+    });
+    return submitOutbound(key, items, assertSendAllowed).catch((error) => {
+      log(`QQ 发送停止 (${key}):`, error?.message ?? error);
+      return error.sent ?? [];
+    });
   }
 
 
@@ -8113,37 +8021,14 @@ async function main() {
   }
 
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
-    const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
-    const sent = [];
-    const failed = [];
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-      const useReply = i === 0 ? replyToMessageId : null;
-      const useAt = i === 0 ? atUserId : null;
-      sendChain = sendChain
-        .then(async () => {
-          assertSendAllowed();
-          await onebotSend(kind, id, msg, useReply, useAt);
-          sent.push(msg);
-        })
-        .catch((error) => {
-          log(`QQ 发送失败 (${key}):`, error?.message ?? error);
-          failed.push(error);
-        });
-      if (i < delays.length) {
-        const d = delays[i];
-        sendChain = sendChain.then(() => sleep(d));
+    return submitOutbound(key, messages.map((msg, index) => ({
+      delayAfterMs: delays[index] ?? 0,
+      transport: async () => {
+        await onebotSend(kind, id, msg, index === 0 ? replyToMessageId : null, index === 0 ? atUserId : null);
+        return msg;
       }
-    }
-    return sendChain.then(() => {
-      if (failed.length > 0) {
-        const err = new Error(`QQ 发送失败 ${failed.length}/${messages.length} 条：${failed[0]?.message ?? '未知错误'}`);
-        err.sent = sent.slice();
-        throw err;
-      }
-      return sent;
-    });
+    })));
   }
 
   // 审计范围：closed-agent 仅对 owner 私聊跳过；其余模式/会话一律审计
@@ -8155,12 +8040,13 @@ async function main() {
   }
 
   // 入队校验无法约束排队等待期间的权限变化，每条消息临近实际发送时再次校验。
-  function captureSendGuard(key) {
+  function captureSendGuard(key, { ai = true } = {}) {
     const policy = sessionPolicy(key);
     const sessionId = state.sessions[key];
     const agentToken = socialV2.conversations.get(key)?.agentToken;
     return () => {
-      if (!isSessionAllowedInCurrentMode(key) || policy !== sessionPolicy(key)
+      if ((ai && (shouldBlockSilentReply(key) || (currentMode === 'reserved2' && socialV2.paused)))
+          || !isSessionAllowedInCurrentMode(key) || policy !== sessionPolicy(key)
           || state.sessions[key] !== sessionId
           || socialV2.conversations.get(key)?.agentToken !== agentToken) {
         throw new Error('发送已取消：会话、模式或白名单已变化');
@@ -8185,8 +8071,8 @@ async function main() {
       }
       return false;
     }
-    await sendToQQ(key, text);
-    return true;
+    const sent = await sendToQQ(key, text, { ai: true });
+    return sent.length > 0;
   }
 
   // 会话模型应用去重：每个 DSH 会话在本进程内只 selectModel 一次；
@@ -8715,7 +8601,7 @@ async function main() {
           agentToken: st.agentToken,
           bootstrapSent: st.bootstrapSent,
           wakeTimes: st.wakeTimes.slice(-200),
-          sendTimes: st.sendTimes.slice(-500),
+          sendTimes: st.sendTimes,
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
           lastIncomingAt: st.lastIncomingAt || 0,
           preSleepWaitSatisfiedAt: st.preSleepWaitSatisfiedAt || 0,
@@ -10074,6 +9960,11 @@ async function main() {
     const now = Date.now();
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
+    if (!list.length) return;
+    st.lastAiReplyAt = now;
+    st.lastActionAt = now;
+    st.wakeConfig.noActionCount = 0;
+    scheduleReplyCheckV2(key);
     for (let i = 0; i < list.length; i++) {
       const text = redactKnownTokensOnly(String(list[i] ?? '')).slice(0, 200);
       st.recentMessages.push({
@@ -11064,6 +10955,7 @@ async function main() {
           reverse.delete(old);
           collectors.delete(old);
           sendToolSucceededSessions.delete(old);
+          sendToolUncertainSessions.delete(old);
           pendingSendToolCalls.delete(old);
           v2TurnStartAt.delete(old);
           turnLeaseNoted.delete(old);
@@ -11559,6 +11451,7 @@ async function main() {
             // 只有“发送成功”才跳过自动转发；如果工具调用失败，仍允许 AI 的文本正常发出。
             if (frame.event.type === 'turn/start') {
               sendToolSucceededSessions.delete(frame.sessionId);
+              sendToolUncertainSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
               v2TurnStartAt.set(frame.sessionId, Date.now());
               turnLeaseNoted.delete(frame.sessionId);
@@ -11606,7 +11499,8 @@ async function main() {
                 if (pending?.has(callId)) {
                   pending.delete(callId);
                   if (pending.size === 0) pendingSendToolCalls.delete(frame.sessionId);
-                  if (!resultError) {
+                  if (sendResultUncertain(frame.event.data?.message)) sendToolUncertainSessions.add(frame.sessionId);
+                  if (sendResultSucceeded(frame.event.data?.message)) {
                     sendToolSucceededSessions.add(frame.sessionId);
                   }
                 }
@@ -11654,7 +11548,9 @@ async function main() {
               collectors.delete(frame.sessionId);
               turnLeaseNoted.delete(frame.sessionId);
               const sendToolSucceeded = sendToolSucceededSessions.has(frame.sessionId);
+              const sendToolUncertain = sendToolUncertainSessions.has(frame.sessionId);
               sendToolSucceededSessions.delete(frame.sessionId);
+              sendToolUncertainSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
               toolCallNames.delete(frame.sessionId);
               if (!completed) {
@@ -11759,6 +11655,10 @@ async function main() {
                   continue;
                 }
                 // 本回合已经通过 MCP 发送工具成功发出消息：跳过自动转发，避免重复发送。
+                if (sendToolUncertain && !sendToolSucceeded) {
+                  log(`工具发送结果未确认，跳过自动转发以免重复 (${key})`);
+                  continue;
+                }
                 if (sendToolSucceeded) {
                   log(`工具已发送消息，跳过自动转发 (${key})`);
                   if (isFarewell) {
@@ -11811,11 +11711,9 @@ async function main() {
                   const messages = timeline.main;
                   log(`agent 回复 (${key}) ${plain.length} 字 → ${messages.length} 条`);
                   appendActivity(`${key} agent 回复：${messages[0].slice(0, 80)}${messages.length > 1 ? '（分' + messages.length + '条）' : ''}${messages[0].length > 80 ? '…' : ''}`);
-                  if (messages.length > 1) {
-                    await sendBurstToQQ(key, messages, cfg.social);
-                  } else {
-                    await sendToQQ(key, messages[0]);
-                  }
+                  const sent = messages.length > 1
+                    ? await sendBurstToQQ(key, messages, cfg.social)
+                    : await sendToQQ(key, messages[0], { ai: true });
                   // 发言后刷新活跃时间，并调度可能的二次补刀
                   const st = socialState(key);
                   if (isFarewell) {
@@ -11828,7 +11726,7 @@ async function main() {
                     // 退场期间有旧回复恰好完成：照常发出，但不把它当作退场，也不调度补刀
                     log(`社交模式：${key} 退场期间旧回复完成，保持退场状态`);
                   } else {
-                    if (lastSendSucceeded(key)) {
+                    if (sent.length > 0) {
                       st.lastActiveMessageAt = Date.now();
                       st.lastAiReplyAt = Date.now();
                       log(`社交模式：发言完成，刷新活跃时间 (${key})`);
@@ -11850,7 +11748,7 @@ async function main() {
                   }
                   log(`agent 回复 (${key}) ${plain.length} 字`);
                   appendActivity(`${key} agent 回复：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
-                  await sendToQQ(key, plain);
+                  await sendToQQ(key, plain, { ai: true });
                 }
               } else if (ended.reason.kind === 'error') {
                 const error = ended.reason.error;
@@ -11977,6 +11875,7 @@ async function main() {
         collectors.clear(); // 清除旧 turn collector，避免重连后残留导致重复累加
         social.silentTurns.clear(); // 清除未消费的摘要静默名额，避免重连后吞掉正常回复
         sendToolSucceededSessions.clear();
+        sendToolUncertainSessions.clear();
         pendingSendToolCalls.clear();
         v2TurnStartAt.clear();
         toolCallNames.clear();

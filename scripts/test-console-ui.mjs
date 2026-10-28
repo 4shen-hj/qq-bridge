@@ -175,6 +175,11 @@ try {
     await fill('v2AutoReplyCheckSec', 17);
     await fill('v2WaitDefaultQuietMs', 0);
     await fill('v2MaxSendMin', 0);
+    if (!original) {
+      await fill('v2MinSendInterval', 0);
+      await fill('v2QueueMaxMessages', 17);
+      await fill('v2QueueTtl', 90000);
+    }
     await check('v2ProvideRecommendations', false);
     const firstTool = page.locator('[data-v2-tool]').first();
     await reveal('[data-v2-tool]');
@@ -188,6 +193,11 @@ try {
     assert.equal(body.autoReplyCheckMs, 17000);
     assert.equal(body.wait.defaultQuietMs, 0);
     assert.equal(body.send.maxSendPerMinute, 0);
+    if (!original) {
+      assert.equal(body.send.minSendIntervalMs, 0);
+      assert.equal(body.send.queueMaxMessages, 17);
+      assert.equal(body.send.queueTtlMs, 90000);
+    }
     assert.equal(body.provideRecommendations, false);
     assert.equal(body.tools[await firstTool.getAttribute('data-v2-tool')], false);
     // The lower save button must submit the same complete configuration.
@@ -258,9 +268,24 @@ try {
       for (const request of configWrites) {
         assert.equal(Object.hasOwn(request.body.tools, 'sendVoice'), false, 'The historical console predates the voice tool switch');
         request.body.tools.sendVoice = true;
+        Object.assign(request.body.send, { minSendIntervalMs: 0, queueMaxMessages: 17, queueTtlMs: 90000 });
       }
     }
     assert.deepEqual(fixture.requests, expected);
+  });
+
+  if (!original) await test('Normal send cooldown is displayed as not sent', async () => {
+    await page.route('**/api/test-send', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, sent: 0, reason: 'expired' }) }));
+    await reveal('#tsSend');
+    await page.click('#tsSend');
+    await page.waitForFunction(() => document.getElementById('tsMsg2').textContent.includes('未发送'));
+    assert.doesNotMatch(await page.textContent('#tsMsg2'), /已发送/);
+    await page.unroute('**/api/test-send');
+    await page.route('**/api/test-send', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: false, sent: 0, attempted: 1, uncertain: 1, status: 'unknown' }) }));
+    await page.click('#tsSend');
+    await page.waitForFunction(() => document.getElementById('tsMsg2').textContent.includes('发送结果未确认'));
+    assert.doesNotMatch(await page.textContent('#tsMsg2'), /未发送|已发送/);
+    await page.unroute('**/api/test-send');
   });
 
   if (!original) await test('Token usage panel renders totals, per-conversation and per-turn cost', async () => {
